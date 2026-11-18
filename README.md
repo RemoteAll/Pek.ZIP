@@ -5,7 +5,7 @@
 - Rust [`Pek.IP`](../Rust/Pek.IP)（`xdb v3` + MaxMind MMDB + 双源合并 + 按需下载）；
 - C# [`DH.NIP`](../../Pek.FrameWork/DH.NIP)（NewLife.IP：纯真 `ip.gz` + 在线 API + DB-IP CSV 转换）。
 
-Zig 0.17.0，**零第三方依赖**（全部 std：`Io`/`File.createMemoryMap`/`compress.flate`/`zip`/`json`/`http`）。
+Zig **0.17.1**（本机实测版本；`build.zig.zon` 的最低版本仍为 0.17.0），**零第三方依赖**（全部 std：`Io`/`File.createMemoryMap`/`compress.flate`/`zip`/`json`/`http`）。
 
 ## 特性
 

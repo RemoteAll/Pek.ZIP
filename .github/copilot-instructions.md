@@ -6,7 +6,7 @@
 ## 项目速览
 
 - **定位**：Pek 生态 IP 归属地库的 **Zig** 实现；对标 Rust `Pek.IP`（xdb v3 + MMDB + 合并 + 按需下载）与 C# `DH.NIP`（纯真 `ip.gz` + 在线 API + CSV 转换）。
-- **技术栈**：Zig 0.17.0，**零第三方依赖**（`std.Io` / `File.createMemoryMap` / `compress.flate` / `zip` / `json` / `http` / `crypto`）。
+- **技术栈**：Zig **0.17.1**（本机实测；`build.zig.zon` 最低 0.17.0，补丁版本兼容），**零第三方依赖**（`std.Io` / `File.createMemoryMap` / `compress.flate` / `zip` / `json` / `http` / `crypto`）。
 - **产物**：库模块 `pek_zip`（`src/root.zig`）+ CLI `zpk`（`src/main.zig`）+ 基准 `zpk-bench`（`bench/`）。
 
 ## 关键约定（改动前必读）

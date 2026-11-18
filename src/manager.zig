@@ -24,6 +24,7 @@ const config_mod = @import("config.zig");
 const catalog_mod = @import("catalog.zig");
 const store_mod = @import("store.zig");
 const http_mod = @import("http.zig");
+const auth_mod = @import("auth.zig");
 const xdb_mod = @import("xdb.zig");
 const mmdb_mod = @import("mmdb.zig");
 const qqwry_mod = @import("qqwry.zig");
@@ -115,6 +116,64 @@ const SpinLock = struct {
     }
 };
 
+/// 机器级同步锁：同机多应用同时启动时只让一个进程去下载/解压，其余直接复用共享缓存。
+///
+/// 用「独占创建锁文件」而不是 advisory lock —— 后者在 Windows 上即便
+/// `lock_nonblocking` 也可能阻塞（实测直接把测试挂住），前者永不阻塞。
+/// 崩溃残留由 mtime 兜底：超过 10 分钟视为陈旧，删掉重取一次。
+const SyncLock = struct {
+    path: [512]u8 = @splat(0),
+    path_len: usize = 0,
+    io: std.Io,
+    held: bool = false,
+
+    const stale_ns: i96 = 10 * 60 * std.time.ns_per_s;
+
+    fn acquire(io: std.Io, cache_dir: []const u8) ?SyncLock {
+        std.Io.Dir.cwd().createDirPath(io, cache_dir) catch return null;
+        var self = SyncLock{ .io = io };
+        const path = std.fmt.bufPrint(&self.path, "{s}/.sync.lock", .{cache_dir}) catch return null;
+        self.path_len = path.len;
+
+        if (tryCreate(io, path)) {
+            self.held = true;
+            return self;
+        }
+
+        // 已存在：判断是否陈旧（上一个进程崩溃留下的）
+        if (isStale(io, path)) {
+            std.Io.Dir.cwd().deleteFile(io, path) catch {};
+            if (tryCreate(io, path)) {
+                self.held = true;
+                return self;
+            }
+        }
+        return null;
+    }
+
+    fn tryCreate(io: std.Io, path: []const u8) bool {
+        const file = std.Io.Dir.cwd().createFile(io, path, .{
+            .read = false,
+            .truncate = false,
+            .exclusive = true,
+        }) catch return false;
+        file.close(io);
+        return true;
+    }
+
+    fn isStale(io: std.Io, path: []const u8) bool {
+        const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+        const now = std.Io.Clock.real.now(io).nanoseconds;
+        return now - stat.mtime.nanoseconds > stale_ns;
+    }
+
+    fn release(self: *SyncLock) void {
+        if (!self.held) return;
+        self.held = false;
+        std.Io.Dir.cwd().deleteFile(self.io, self.path[0..self.path_len]) catch {};
+    }
+};
+
 pub const Manager = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -134,6 +193,8 @@ pub const Manager = struct {
     state_text: [4][512]u8 = @splat(@as([512]u8, @splat(0))),
     /// 已完成的查询次数（诊断用）。
     lookups: std.atomic.Value(u64) = .init(0),
+    /// 下载授权客户端（懒加载；零身份自动注册，首次下载时创建）。
+    auth: ?auth_mod.AuthClient = null,
     /// 被替换下来的旧定位器：**只延后释放**（廉价 hazard pointer 替代），
     /// 运行期不销毁，避免「读方刚拿到指针就被销毁」的竞态；替换次数很少（启动一次 + 手动 sync）。
     retired: std.ArrayList(*Shared) = .empty,
@@ -393,6 +454,13 @@ pub const Manager = struct {
             return;
         }
 
+        // 同机多应用同时启动时，只让一个进程去下载（共享 CacheDir 时全机复用）
+        var lock = SyncLock.acquire(self.io, self.cfg.cache_dir) orelse {
+            std.debug.print("[pek-zip] 另一进程正在同步数据（锁：{s}/.sync.lock），本次跳过下载，直接复用共享缓存\n", .{self.cfg.cache_dir});
+            return;
+        };
+        defer lock.release();
+
         var client = try http_mod.Client.init(self.io, self.gpa, self.cfg.ca_file);
         defer client.deinit();
 
@@ -409,10 +477,23 @@ pub const Manager = struct {
             return;
         }
 
-        // 配了 PubKey 就强制验签（v0.1 未实现 Ed25519 校验时明确拒绝，而不是静默放行）
+        // 配了 PubKey 就强制验签（目录被篡改宁可不可用）
         if (self.cfg.pubkey.len > 0) {
-            self.setError("已配置 PubKey，但 v0.1 尚未实现组件目录 Ed25519 验签：出于安全考虑拒绝下载（清空 PubKey 或等验签版本）", .{});
-            return;
+            const sig_url = try std.fmt.allocPrint(arena, "{s}.sig", .{catalog_url});
+            var sig_response = client.getBytes(sig_url, &.{}, MAX_SIGNATURE_BYTES) catch |err| {
+                self.setError("拉取组件目录签名失败：{s}；URL={s}（检查证书/网络）", .{ @errorName(err), sig_url });
+                return;
+            };
+            defer sig_response.deinit(self.gpa);
+            if (!sig_response.isSuccess()) {
+                self.setError("拉取组件目录签名失败：HTTP {d}，URL={s}", .{ sig_response.status, sig_url });
+                return;
+            }
+            const sig_text = std.mem.trim(u8, sig_response.body, " \t\r\n");
+            auth_mod.verifyBase64(self.cfg.pubkey, response.body, sig_text) catch |err| {
+                self.setError("组件目录签名校验失败：{s}（PubKey 或目录可能被篡改；URL={s}）", .{ @errorName(err), catalog_url });
+                return;
+            };
         }
 
         var catalog = catalog_mod.parse(self.gpa, response.body) catch |err| {
@@ -430,11 +511,77 @@ pub const Manager = struct {
                 continue;
             };
             self.downloadAndInstall(arena, &client, dataset, entry) catch |err| {
-                self.setError("安装 {s} 失败：{s}（version={s}，url={s}）", .{
-                    dataset.id(), @errorName(err), entry.version, entry.url,
-                });
+                const hint = switch (err) {
+                    error.AuthPending => "客户端已注册但等待平台批准：面板「分发中心 → IP 授权」点「批准」后重跑 zpk sync",
+                    error.AuthRevoked => "客户端已被平台吐销：面板「IP 授权」页恢复并重新批准",
+                    error.Denied => "平台拒给授权（检查 StateDir 里的 installId 是否被重置/公钥不匹配）",
+                    error.BadSignature => "签名校验失败（配置的 PubKey 与平台不一致，或本地身份文件损坏）",
+                    else => "",
+                };
+                if (hint.len > 0) {
+                    self.setError("安装 {s} 失败：{s}（version={s}）→ {s}", .{ dataset.id(), @errorName(err), entry.version, hint });
+                } else {
+                    self.setError("安装 {s} 失败：{s}（version={s}，url={s}）", .{ dataset.id(), @errorName(err), entry.version, entry.url });
+                }
             };
         }
+    }
+
+    /// 懒加载授权客户端（身份文件在 `StateDir`，首次创建后持久化）。
+    fn authClient(self: *Manager) !*auth_mod.AuthClient {
+        if (self.auth == null) {
+            const platform_pubkey: ?[]const u8 = if (self.cfg.pubkey.len > 0) self.cfg.pubkey else null;
+            self.auth = try auth_mod.AuthClient.loadOrCreate(self.io, self.gpa, self.cfg.state_dir, platform_pubkey);
+        }
+        return &self.auth.?;
+    }
+
+    /// 客户端 installId（未初始化时会创建身份）。
+    pub fn installId(self: *Manager) ![]const u8 {
+        const client = try self.authClient();
+        return client.installId();
+    }
+
+    /// 客户端公钥（hex）。
+    pub fn clientPubKey(self: *Manager) ![]const u8 {
+        const client = try self.authClient();
+        return client.pubKeyHex();
+    }
+
+    /// 主动注册/续期 License（CLI `zpk enroll`）：`true` = 已批准；`error.AuthPending` = 等待批准。
+    pub fn enrollNow(self: *Manager) !void {
+        if (self.cfg.store_url.len == 0) return error.NoStoreUrl;
+        var client = try http_mod.Client.init(self.io, self.gpa, self.cfg.ca_file);
+        defer client.deinit();
+        const auth = try self.authClient();
+        auth.ensureLicense(self.cfg.store_url, &client) catch |err| switch (err) {
+            error.Unsupported => return error.AuthUnsupported,
+            else => return err,
+        };
+    }
+
+    /// 解析下载 URL：优先用平台票据（自动注册 + Ed25519 签名）；旧平台回退公开 URL。
+    fn downloadUrl(
+        self: *Manager,
+        arena: std.mem.Allocator,
+        client: *http_mod.Client,
+        entry: *const catalog_mod.Entry,
+        buf: []u8,
+    ) ![]const u8 {
+        if (!self.cfg.auto_enroll or self.cfg.store_url.len == 0) {
+            return absoluteUrl(arena, self.cfg.store_url, entry.url);
+        }
+        const auth = try self.authClient();
+        const ticket_url = auth.ticket(self.cfg.store_url, client, entry.id, entry.version, buf) catch |err| switch (err) {
+            error.Unsupported => {
+                std.debug.print("[pek-zip] 平台未启用 IP 下载授权（旧版本），回退公开下载：{s}\n", .{entry.url});
+                return absoluteUrl(arena, self.cfg.store_url, entry.url);
+            },
+            error.Pending => return error.AuthPending,
+            error.Revoked => return error.AuthRevoked,
+            else => return err,
+        };
+        return ticket_url;
     }
 
     fn downloadAndInstall(
@@ -444,7 +591,8 @@ pub const Manager = struct {
         dataset: Dataset,
         entry: *const catalog_mod.Entry,
     ) !void {
-        const url = try absoluteUrl(arena, self.cfg.store_url, entry.url);
+        var url_buf: [2048]u8 = undefined;
+        const url = try self.downloadUrl(arena, client, entry, &url_buf);
         const stamp = std.Io.Clock.real.now(self.io).nanoseconds;
         const temp_path = try std.fmt.allocPrint(arena, "{s}/.download-{s}-{s}-{d}.zip", .{
             self.cfg.cache_dir, entry.id, entry.version, @as(u64, @intCast(@mod(stamp, 1_000_000_000))),
@@ -715,6 +863,25 @@ test "后台补缺失败不阻塞查询（错误可见、旧数据保留）" {
     try testing.expect(again.is_private);
 
     std.Io.Dir.cwd().deleteTree(io, base) catch {};
+}
+
+test "同步锁：第二个持有者被拒，释放后可再取（进程退出自动释放）" {
+    const gpa = testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir = "G:/Code/Zig/Pek.ZIP/.zig-cache/locktest";
+    std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    var first = SyncLock.acquire(io, dir) orelse return error.TestUnexpectedResult;
+    try testing.expect(SyncLock.acquire(io, dir) == null);
+    first.release();
+
+    var again = SyncLock.acquire(io, dir) orelse return error.TestUnexpectedResult;
+    again.release();
+
+    std.Io.Dir.cwd().deleteTree(io, dir) catch {};
 }
 
 test "并发读取期间热替换不崩溃（引用计数）" {

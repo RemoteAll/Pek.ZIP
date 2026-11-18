@@ -202,10 +202,14 @@ pub const QqwryReader = struct {
     }
 
     fn readAddress(self: *const QqwryReader, start: usize) Error![]const u8 {
+        if (start >= self.blob.bytes.len) return Error.Corrupt;
         var p = start;
-        const value = readU32(self.blob.bytes, p) orelse return Error.Corrupt;
-        const tag = value & 0xFF;
-        if (tag == 1 or tag == 2) p = value >> 8;
+        // 最后一条记录的空地址段可能正好落在文件末尾：此时只剩 1 个 0x00，
+        // 不足 4 字节读不出 u32，但那是合法数据（不是损坏），按普通字符串读即可。
+        if (readU32(self.blob.bytes, p)) |value| {
+            const tag = value & 0xFF;
+            if (tag == 1 or tag == 2) p = value >> 8;
+        }
         return self.readString(p);
     }
 

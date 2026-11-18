@@ -105,6 +105,72 @@ fn run(io: std.Io, gpa: std.mem.Allocator, argv: []const [:0]const u8) !u8 {
         return 0;
     }
 
+    if (std.mem.eql(u8, command, "csv2db")) {
+        // DB-IP CSV → 纯真 QQWry（仅适合 country/asn 级或裁剪后的数据；超 16 MiB 会明确报错）
+        if (positional_count < 3) return usage(io, "csv2db 需要 <输入.csv> <输出.dat>");
+        const stats = pek.qqwry_writer.convert(io, gpa, positional[1], positional[2]) catch |err| {
+            var buf: [512]u8 = undefined;
+            const hint = if (err == error.TooLarge) "（纯真格式偏移只有 24 位，数据区须 < 16 MiB：请用 country 级 CSV 或先按国家裁剪）" else "";
+            try stderr(io, try std.fmt.bufPrint(&buf, "csv2db 失败：{s}{s}\n", .{ @errorName(err), hint }));
+            return 1;
+        };
+        var line: [512]u8 = undefined;
+        try stdout(io, try std.fmt.bufPrint(&line, "转换完成：{d} 条（跳过 {d}），数据区 {d} 字节，文件 {d} 字节\n", .{
+            stats.records, stats.skipped, stats.data_bytes, stats.output_bytes,
+        }));
+        return 0;
+    }
+
+    if (std.mem.eql(u8, command, "online")) {
+        if (positional_count < 2) return usage(io, "online 需要至少一个 IP");
+        var client = try pek.http.Client.init(io, gpa, null);
+        defer client.deinit();
+        const resolver = pek.online.Resolver{ .gpa = gpa };
+        var line: [512]u8 = undefined;
+        for (positional[1..positional_count]) |text| {
+            if (resolver.lookup(&client, text)) |record| {
+                var buf: [256]u8 = undefined;
+                defer record.deinit(gpa);
+                try stdout(io, try std.fmt.bufPrint(&line, "{s}\t{s}\n", .{ text, record.display(&buf) }));
+            } else {
+                try stdout(io, try std.fmt.bufPrint(&line, "{s}\t（在线查询失败或未命中）\n", .{text}));
+            }
+        }
+        return 0;
+    }
+
+    if (std.mem.eql(u8, command, "enroll")) {
+        // 零身份注册：打印 installId / 公钥，便于在面板「IP 授权」页批准
+        const manager = try pek.Manager.start(io, gpa, base, .{ .background = false });
+        defer manager.destroy();
+
+        var line: [1024]u8 = undefined;
+        const install_id = try manager.installId();
+        const pubkey = try manager.clientPubKey();
+        try stdout(io, try std.fmt.bufPrint(&line, "installId : {s}\n公钥      : {s}\n", .{ install_id, pubkey }));
+
+        manager.enrollNow() catch |err| switch (err) {
+            error.Pending => {
+                try stdout(io, "状态      : 已提交注册，等待平台管理员批准（面板 → 分发中心 → IP 授权）\n");
+                return 0;
+            },
+            error.AuthUnsupported => {
+                try stdout(io, "状态      : 平台未启用 IP 下载授权（旧版本），将使用公开下载\n");
+                return 0;
+            },
+            error.NoStoreUrl => {
+                try stderr(io, "未配置 StoreUrl（仅本地缓存模式）\n");
+                return 1;
+            },
+            else => {
+                try stdout(io, try std.fmt.bufPrint(&line, "状态      : 失败（{s}）\n", .{@errorName(err)}));
+                return 1;
+            },
+        };
+        try stdout(io, "状态      : 已批准（可正常下载数据包）\n");
+        return 0;
+    }
+
     if (std.mem.eql(u8, command, "sync")) {
         const manager = try pek.Manager.start(io, gpa, base, .{ .background = false, .allow_partial = true });
         defer manager.destroy();
@@ -186,7 +252,10 @@ fn usage(io: std.Io, reason: []const u8) !u8 {
         \\
         \\用法：
         \\  zpk lookup <ip>... [--online] [--base <目录>]
+        \\  zpk enroll [--base <目录>]
         \\  zpk sync [--base <目录>]
+        \\  zpk online <ip>...             在线 API 兜底查询（ip-api.com）
+        \\  zpk csv2db <输入.csv> <输出.dat>   DB-IP CSV → 纯真格式
         \\  zpk selfcheck [--base <目录>]
         \\  zpk version
         \\

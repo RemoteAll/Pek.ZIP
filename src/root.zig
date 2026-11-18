@@ -16,11 +16,14 @@ pub const gb2312 = @import("gb2312.zig");
 pub const xdb = @import("xdb.zig");
 pub const mmdb = @import("mmdb.zig");
 pub const qqwry = @import("qqwry.zig");
+pub const qqwry_writer = @import("qqwry_writer.zig");
+pub const online = @import("online.zig");
 pub const locator = @import("locator.zig");
 pub const config = @import("config.zig");
 pub const catalog = @import("catalog.zig");
 pub const store = @import("store.zig");
 pub const http = @import("http.zig");
+pub const auth = @import("auth.zig");
 pub const manager = @import("manager.zig");
 
 pub const IpAddr = ip.IpAddr;
@@ -48,10 +51,13 @@ test {
     _ = xdb;
     _ = mmdb;
     _ = qqwry;
+    _ = qqwry_writer;
+    _ = online;
     _ = locator;
     _ = config;
     _ = catalog;
     _ = store;
     _ = http;
+    _ = auth;
     _ = manager;
 }

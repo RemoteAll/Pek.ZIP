@@ -32,7 +32,9 @@ pub const TEMPLATE =
     \\# Pek.ZIP 配置（首次运行自动生成；只改需要的那几行）
     \\# RPanelServer 平台地址（固定，一般不改）
     \\StoreUrl = "https://p.sc8.fun"
-    \\# 平台 Ed25519 公钥（64 位 hex 或 SPKI DER base64）；非空 = 强制校验组件目录签名
+    \\# 平台 Ed25519 公钥：64 位 hex（32 字节裸公钥）或 88 位 hex（44 字节 SPKI DER）。
+    \\# 留空 = 首次注册时从平台响应里学习公钥并落盘固定（TOFU），**不需要每个应用都配**；
+    \\# 只有要“预置强校验”（不允许首次学习）时才填。
     \\PubKey = ""
     \\# 本地数据目录（xdb / mmdb 放这里）
     \\DataDir = "data"
@@ -44,6 +46,14 @@ pub const TEMPLATE =
     \\AutoEnroll = true
     \\# 是否下载 IPv6 xdb（约 37 MiB）
     \\DownloadV6 = false
+    \\# 组件目录缓存新鲜期（秒）：期间只读本地 catalog，不联网（0 = 每次都拉）
+    \\CatalogMaxAge = 3600
+    \\# —— 多应用 / 多节点共享（推荐）——
+    \\# 同一台机器上的所有应用指向同一组目录：一次注册（StateDir）、一次下载（CacheDir），
+    \\# 其余进程直接复用；并发启动由 CacheDir/.sync.lock 保证只有一个去下载。
+    \\# DataDir  = "C:/ProgramData/Pek.ZIP/data"
+    \\# CacheDir = "C:/ProgramData/Pek.ZIP/cache"
+    \\# StateDir = "C:/ProgramData/Pek.ZIP/client"
     \\# 平台 https 自定义根证书（PEM 文件；内网/自签平台用）
     \\# CaFile = "Config/ca.pem"
     \\
@@ -70,6 +80,8 @@ pub const Config = struct {
     state_dir: []u8,
     auto_enroll: bool = true,
     download_v6: bool = false,
+    /// 组件目录缓存新鲜期（秒）：期间只读本地 catalog，不联网。0 = 每次都拉。
+    catalog_max_age: u32 = 3600,
     ca_file: ?[]u8 = null,
 
     pub fn deinit(self: *Config) void {
@@ -151,6 +163,8 @@ pub const Config = struct {
                 self.auto_enroll = parseBool(value) orelse self.auto_enroll;
             } else if (std.mem.eql(u8, key, "DownloadV6")) {
                 self.download_v6 = parseBool(value) orelse self.download_v6;
+            } else if (std.mem.eql(u8, key, "CatalogMaxAge")) {
+                self.catalog_max_age = std.fmt.parseInt(u32, unquote(value), 10) catch self.catalog_max_age;
             } else if (std.mem.eql(u8, key, "CaFile")) {
                 const path = unquote(value);
                 if (path.len > 0) {

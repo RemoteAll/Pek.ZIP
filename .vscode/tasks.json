@@ -1,0 +1,53 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "接续自检（打开项目自动运行）",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "tools/continuity/install-global-instruction.ps1"
+      ],
+      "runOptions": {
+        "runOn": "folderOpen"
+      },
+      "presentation": {
+        "reveal": "silent",
+        "panel": "shared",
+        "close": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "一键回归（构建 + 单测 + CLI 自检）",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "tools/regression.ps1"
+      ],
+      "group": "test",
+      "problemMatcher": []
+    },
+    {
+      "label": "性能基准（ReleaseFast）",
+      "type": "shell",
+      "command": "zig",
+      "args": [
+        "build",
+        "bench",
+        "--",
+        "G:/Code/Rust/Pek.IP/data",
+        "200000"
+      ],
+      "problemMatcher": []
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+# 统一换行，避免不同机器 checkout 后字节不一致（接续模板要做字节级比对）
+* text=auto eol=lf
+
+# 接续模板必须原样保存（`-text` = 不做任何换行转换，字节级一致才能被 _sync -Check 判为一致）
+tools/continuity/templates/*.md -text
+
+# 二进制
+*.bin binary
+*.zip binary
+*.png binary

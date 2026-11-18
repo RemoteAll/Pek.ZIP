@@ -1,0 +1,18 @@
+# Zig
+.zig-cache/
+zig-out/
+
+# 运行期数据（数据文件随各自许可分发，不入库）
+/data/
+/Data/
+/Config/
+*.xdb
+*.mmdb
+*.zip
+!tests/data/*.zip
+
+# 回归报告
+artifacts/
+
+# 编辑器
+.vscode/*.log

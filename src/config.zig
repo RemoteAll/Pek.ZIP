@@ -55,6 +55,10 @@ pub const TEMPLATE =
     \\# 后台定时检查更新的间隔（分钟；0 = 关闭）。开启后每轮只多一次目录 GET，
     \\# 且受 CatalogMaxAge 约束——只在发现新版本时才下包（常驻服务推荐 360）。
     \\AutoUpdateMinutes = 0
+    \\# 本地镜像（可选）：指向本机/内网的组件镜像（如 RAgent 的 /ipdb），
+    \\# 配了之后目录与安装包都从镜像拿（目录签名仍用平台公钥校，镜像只转发不重签）。
+    \\# 好处：同一台机器的多个进程只让镜像下一次；镜像未就绪时自动回落平台。
+    \\# MirrorUrl = "http://127.0.0.1:8899/ipdb"
     \\# —— 多应用 / 多节点共享（推荐）——
     \\# 同一台机器上的所有应用指向同一组目录：一次注册（StateDir）、一次下载（CacheDir），
     \\# 其余进程直接复用；并发启动由 CacheDir/.sync.lock 保证只有一个去下载。
@@ -82,6 +86,8 @@ pub const Config = struct {
     base: []u8,
     store_url: []u8,
     pubkey: []u8,
+    /// 本地镜像根（如 `http://127.0.0.1:8899/ipdb`；空 = 直连平台）。
+    mirror_url: []u8,
     data_dir: []u8,
     cache_dir: []u8,
     state_dir: []u8,
@@ -100,6 +106,7 @@ pub const Config = struct {
         gpa.free(self.base);
         gpa.free(self.store_url);
         gpa.free(self.pubkey);
+        gpa.free(self.mirror_url);
         gpa.free(self.data_dir);
         gpa.free(self.cache_dir);
         gpa.free(self.state_dir);
@@ -114,6 +121,7 @@ pub const Config = struct {
             .base = gpa.dupe(u8, base) catch return Error.OutOfMemory,
             .store_url = gpa.dupe(u8, DEFAULT_STORE_URL) catch return Error.OutOfMemory,
             .pubkey = gpa.dupe(u8, "") catch return Error.OutOfMemory,
+            .mirror_url = gpa.dupe(u8, "") catch return Error.OutOfMemory,
             .data_dir = undefined,
             .cache_dir = undefined,
             .state_dir = undefined,
@@ -161,6 +169,8 @@ pub const Config = struct {
                 if (text_value.len > 0) try self.setStoreUrl(text_value);
             } else if (std.mem.eql(u8, key, "PubKey")) {
                 try self.setPubKey(unquote(value));
+            } else if (std.mem.eql(u8, key, "MirrorUrl")) {
+                try self.setMirrorUrl(unquote(value));
             } else if (std.mem.eql(u8, key, "DataDir")) {
                 const path = unquote(value);
                 if (path.len > 0) try self.setPath(&self.data_dir, path);
@@ -210,6 +220,15 @@ pub const Config = struct {
         const dup = self.gpa.dupe(u8, value) catch return Error.OutOfMemory;
         self.gpa.free(self.pubkey);
         self.pubkey = dup;
+    }
+
+    /// 镜像地址去掉尾部 `/`（空串 = 直连平台）。
+    fn setMirrorUrl(self: *Config, value: []const u8) Error!void {
+        var trimmed = value;
+        while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') trimmed = trimmed[0 .. trimmed.len - 1];
+        const dup = self.gpa.dupe(u8, trimmed) catch return Error.OutOfMemory;
+        self.gpa.free(self.mirror_url);
+        self.mirror_url = dup;
     }
 
     fn resolve(self: *Config, value: []const u8) Error![]u8 {

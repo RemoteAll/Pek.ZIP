@@ -250,8 +250,9 @@ fn printStatus(io: std.Io, manager: *pek.Manager) !void {
         .tofu => "(留空：用注册时 TOFU 学到的平台公钥强制验签)",
         else => "(未配置且尚未注册：本次不校验目录签名)",
     };
-    try stdout(io, try std.fmt.bufPrint(&line, "StoreUrl : {s}\nDataDir  : {s}\nCacheDir : {s}\nPubKey   : {s}\n下载IPv6 : {}\n目录TTL  : {d}s（0 = 每次都拉）\n请求超时 : {d}ms（0 = 不限）\n定时检查 : {d}min（0 = 关闭）\n", .{
+    try stdout(io, try std.fmt.bufPrint(&line, "StoreUrl : {s}\nMirrorUrl: {s}\nDataDir  : {s}\nCacheDir : {s}\nPubKey   : {s}\n下载IPv6 : {}\n目录TTL  : {d}s（0 = 每次都拉）\n请求超时 : {d}ms（0 = 不限）\n定时检查 : {d}min（0 = 关闭）\n", .{
         cfg.store_url,
+        if (cfg.mirror_url.len == 0) "(未配置：直连平台)" else cfg.mirror_url,
         cfg.data_dir,
         cfg.cache_dir,
         pubkey_desc,

@@ -124,6 +124,26 @@ try {
     # captured file is mojibake. '3600s' only appears in the "reuse cached catalog" line;
     # 'BadSignature' only appears when cache verification failed.
     $cached_ok = ($r3 -match '3600s') -and -not ($r3 -match 'BadSignature')
+
+    # 8) mirror mode: catalog + packages must come from MirrorUrl, not from StoreUrl.
+    #    StoreUrl points at a dead port on purpose - if the mirror were ignored the sync could not install.
+    New-Item -ItemType Directory -Force "$root\base2\Config", "$root\base2\data" | Out-Null
+    Set-Content "$root\base2\data\dbip-city-lite.mmdb" -Value 'placeholder' -Encoding ascii
+    Set-Content "$root\base2\data\dbip-asn-lite.mmdb" -Value 'placeholder' -Encoding ascii
+    $cfg_mirror = "StoreUrl = `"http://127.0.0.1:1`"`nMirrorUrl = `"http://127.0.0.1:$port`"`nPubKey = `"`"`nAutoEnroll = false`nDownloadV6 = false`nDataDir = `"data`"`nCacheDir = `"cache`"`nStateDir = `"client`"`nCatalogMaxAge = 0`nHttpTimeoutMs = 5000`n"
+    [System.IO.File]::WriteAllText("$root\base2\Config\Ip.toml", $cfg_mirror, (New-Object System.Text.UTF8Encoding($false)))
+    $code5 = Invoke-Zpk @('sync', '--base', "$root\base2") "$root\sync4.txt"
+    $mirror_installed = Test-Path "$root\base2\cache\ip2region-v4\2026.11"
+
+    # 9) mirror DOWN, platform up: sync must fall back to StoreUrl and still install.
+    #    (mirror is a bandwidth optimisation, never a new failure mode)
+    New-Item -ItemType Directory -Force "$root\base3\Config", "$root\base3\data" | Out-Null
+    Set-Content "$root\base3\data\dbip-city-lite.mmdb" -Value 'placeholder' -Encoding ascii
+    Set-Content "$root\base3\data\dbip-asn-lite.mmdb" -Value 'placeholder' -Encoding ascii
+    $cfg_fallback = "StoreUrl = `"http://127.0.0.1:$port`"`nMirrorUrl = `"http://127.0.0.1:$port/absent`"`nPubKey = `"`"`nAutoEnroll = false`nDownloadV6 = false`nDataDir = `"data`"`nCacheDir = `"cache`"`nStateDir = `"client`"`nCatalogMaxAge = 0`nHttpTimeoutMs = 5000`n"
+    [System.IO.File]::WriteAllText("$root\base3\Config\Ip.toml", $cfg_fallback, (New-Object System.Text.UTF8Encoding($false)))
+    $code6 = Invoke-Zpk @('sync', '--base', "$root\base3") "$root\sync5.txt"
+    $fallback_installed = Test-Path "$root\base3\cache\ip2region-v4\2026.11"
 } finally {
     Stop-ServerOnPort $port
     Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue
@@ -149,8 +169,10 @@ Assert (-not $v10_after) 'clean-old-version' '2026.10 removed (keep = 1)'
 Assert ([bool]($r2 -match '2026\.11')) 'detect-newer' 'second sync mentions 2026.11'
 Assert ([bool]($lk -match 'Guangdong')) 'lookup-uses-new-data' 'lookup returns v2 region (Guangdong), not v1 (Jiangsu)'
 Assert $cached_ok 'catalog-cache-reused' 'third sync reuses cached catalog (no refetch, no failed signature)'
+Assert $mirror_installed 'mirror-mode' 'sync installs from MirrorUrl while StoreUrl is a dead port'
+Assert $fallback_installed 'mirror-fallback' 'missing mirror falls back to StoreUrl and still installs'
 
-Write-Output ("zpk exit codes (expected 1 for sync: fake catalog ships 1 of 4 datasets): {0}, {1}; lookup={2}; cached-sync={3}" -f $code1, $code2, $code3, $code4)
+Write-Output ("zpk exit codes (expected 1 for sync: fake catalog ships 1 of 4 datasets): {0}, {1}; lookup={2}; cached-sync={3}; mirror-sync={4}; fallback-sync={5}" -f $code1, $code2, $code3, $code4, $code5, $code6)
 if ($fail -gt 0) {
     Write-Output "=== RESULT: FAIL ($fail) ==="
     exit 1

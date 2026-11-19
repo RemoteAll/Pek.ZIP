@@ -48,6 +48,22 @@ pub const DATASET_GEOLITE2_CITY = "geolite2-city";
 pub const DATASET_GEOLITE2_ASN = "geolite2-asn";
 
 const CATALOG_PATH = "/components/catalog.json";
+
+/// 取 URL 的文件名（去掉目录、查询串与片段）。
+pub fn componentFileName(url: []const u8) []const u8 {
+    var rest = url;
+    if (std.mem.indexOfAny(u8, rest, "?#")) |i| rest = rest[0..i];
+    const slash = std.mem.lastIndexOfScalar(u8, rest, '/');
+    return if (slash) |i| rest[i + 1 ..] else rest;
+}
+
+/// 镜像模式下的包地址：`{mirror}/components/{文件名}`。
+///
+/// 目录里的 `url` 是平台绝对地址（`https://p.sc8.fun/components/x.zip`），
+/// 如果原样使用就会绕过镜像直连平台——所以镜像模式必须按文件名重拼。
+pub fn mirrorComponentUrl(arena: std.mem.Allocator, mirror: []const u8, entry_url: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{s}/components/{s}", .{ mirror, componentFileName(entry_url) });
+}
 const MAX_CATALOG_BYTES: usize = 1024 * 1024;
 /// 本地目录缓存：与 `CatalogMaxAge` 配合，避免每次启动/每次 sync 都联网拉目录。
 /// `.catalog.meta` 只有一行 unix 秒（抓取时间）。
@@ -655,21 +671,48 @@ pub const Manager = struct {
         defer client.deinit();
         client.timeout_ms = self.cfg.http_timeout_ms;
 
-        const catalog_url = try std.fmt.allocPrint(arena, "{s}{s}", .{ self.cfg.store_url, CATALOG_PATH });
+        const catalog_url = if (self.cfg.mirror_url.len > 0)
+            // 镜像（本机 RAgent 等）同样放出 `/components/catalog.json` 与 `.sig`，字节与平台一致，
+            // 所以验签仍然对着平台公钥（镜像只转发不重签）。
+            try std.fmt.allocPrint(arena, "{s}{s}", .{ self.cfg.mirror_url, CATALOG_PATH })
+        else
+            try std.fmt.allocPrint(arena, "{s}{s}", .{ self.cfg.store_url, CATALOG_PATH });
 
         // 目录本身有 TTL（`CatalogMaxAge`）：新鲜期内直接用本地缓存，不联网。
         var catalog_body: []const u8 = undefined;
         if (try self.loadCachedCatalog(arena)) |cached| {
             catalog_body = cached;
         } else {
-            var response = client.getBytes(catalog_url, &.{}, MAX_CATALOG_BYTES) catch |err| {
-                self.setError("拉取组件目录失败：{s}；URL={s}（{s}）", .{ @errorName(err), catalog_url, fetchHint(err) });
-                return false;
+            // 镜像优先，但**镜像不可用时自动回退平台**：镜像只是省带宽的优化，
+            // 不能因为它缺文件/没启动就把同步搞挂（这是最容易上新功能时踩的坑）。
+            var active_url = catalog_url;
+            var response = client.getBytes(active_url, &.{}, MAX_CATALOG_BYTES) catch |mirror_err| blk: {
+                if (self.cfg.mirror_url.len == 0) {
+                    self.setError("拉取组件目录失败：{s}；URL={s}（{s}）", .{ @errorName(mirror_err), active_url, fetchHint(mirror_err) });
+                    return false;
+                }
+                active_url = try std.fmt.allocPrint(arena, "{s}{s}", .{ self.cfg.store_url, CATALOG_PATH });
+                std.debug.print("[pek-zip] 镜像目录拉取失败：{s}（{s}），回退平台 {s}\n", .{ @errorName(mirror_err), catalog_url, active_url });
+                break :blk client.getBytes(active_url, &.{}, MAX_CATALOG_BYTES) catch |err| {
+                    self.setError("拉取组件目录失败：{s}；URL={s}（镜像 {s} 也不可用：{s}）", .{ @errorName(err), active_url, catalog_url, @errorName(mirror_err) });
+                    return false;
+                };
             };
+            if (!response.isSuccess() and self.cfg.mirror_url.len > 0 and !std.mem.eql(u8, active_url, catalog_url)) {
+                // 平台也失败：保持原状（下面统一报错）
+            } else if (!response.isSuccess() and self.cfg.mirror_url.len > 0) {
+                response.deinit(self.gpa);
+                active_url = try std.fmt.allocPrint(arena, "{s}{s}", .{ self.cfg.store_url, CATALOG_PATH });
+                std.debug.print("[pek-zip] 镜像目录 HTTP {d}，回退平台 {s}\n", .{ response.status, active_url });
+                response = client.getBytes(active_url, &.{}, MAX_CATALOG_BYTES) catch |err| {
+                    self.setError("拉取组件目录失败：{s}；URL={s}（镜像 {s} 不可用）", .{ @errorName(err), active_url, catalog_url });
+                    return false;
+                };
+            }
             defer response.deinit(self.gpa);
             if (!response.isSuccess()) {
                 self.setError("拉取组件目录失败：HTTP {d}，URL={s}，响应片段：{s}", .{
-                    response.status, catalog_url, response.snippet(200),
+                    response.status, active_url, response.snippet(200),
                 });
                 return false;
             }
@@ -678,7 +721,7 @@ pub const Manager = struct {
             // 配置的 PubKey 优先；留空时用注册时 TOFU 学到的平台公钥（否则留空＝完全不验签，TOFU 形同虚设）
             var sig_text: ?[]const u8 = null;
             if (self.catalogVerifyKey()) |verify_key| {
-                const sig_url = try std.fmt.allocPrint(arena, "{s}.sig", .{catalog_url});
+                const sig_url = try std.fmt.allocPrint(arena, "{s}.sig", .{active_url});
                 var sig_response = client.getBytes(sig_url, &.{}, MAX_SIGNATURE_BYTES) catch |err| {
                     self.setError("拉取组件目录签名失败：{s}；URL={s}（{s}）", .{ @errorName(err), sig_url, fetchHint(err) });
                     return false;
@@ -691,7 +734,7 @@ pub const Manager = struct {
                 sig_text = std.mem.trim(u8, sig_response.body, " \t\r\n");
                 auth_mod.verifyBase64(verify_key, response.body, sig_text.?) catch |err| {
                     self.setError("组件目录签名校验失败：{s}（公钥来源 {s}，目录可能被篡改；URL={s}）", .{
-                        @errorName(err), self.verifyKeySourceText(), catalog_url,
+                        @errorName(err), self.verifyKeySourceText(), active_url,
                     });
                     return false;
                 };
@@ -831,6 +874,22 @@ pub const Manager = struct {
         entry: *const catalog_mod.Entry,
         buf: []u8,
     ) ![]const u8 {
+        // 镜像模式：目录里的 url 是平台绝对地址，把 origin 换成镜像（只取文件名），
+        // 且不走票据（镜像是本机/内网可信源，没有平台授权关系）。
+        if (self.cfg.mirror_url.len > 0) {
+            return mirrorComponentUrl(arena, self.cfg.mirror_url, entry.url);
+        }
+        return self.platformDownloadUrl(arena, client, entry, buf);
+    }
+
+    /// 平台侧下载 URL（票据优先，旧平台回退公开 URL）——镜像不可用时的回退路径。
+    fn platformDownloadUrl(
+        self: *Manager,
+        arena: std.mem.Allocator,
+        client: *http_mod.Client,
+        entry: *const catalog_mod.Entry,
+        buf: []u8,
+    ) ![]const u8 {
         if (!self.cfg.auto_enroll or self.cfg.store_url.len == 0) {
             return absoluteUrl(arena, self.cfg.store_url, entry.url);
         }
@@ -855,17 +914,37 @@ pub const Manager = struct {
         entry: *const catalog_mod.Entry,
     ) !void {
         var url_buf: [2048]u8 = undefined;
-        const url = try self.downloadUrl(arena, client, entry, &url_buf);
+        var url = try self.downloadUrl(arena, client, entry, &url_buf);
+        const mirror_on = self.cfg.mirror_url.len > 0;
         const stamp = std.Io.Clock.real.now(self.io).nanoseconds;
         const temp_path = try std.fmt.allocPrint(arena, "{s}/.download-{s}-{s}-{d}.zip", .{
             self.cfg.cache_dir, entry.id, entry.version, @as(u64, @intCast(@mod(stamp, 1_000_000_000))),
         });
 
         std.Io.Dir.cwd().createDirPath(self.io, self.cfg.cache_dir) catch {};
-        const status = client.getToFile(url, &.{}, temp_path) catch |err| {
+        var status = client.getToFile(url, &.{}, temp_path) catch |mirror_err| blk: {
             std.Io.Dir.cwd().deleteFile(self.io, temp_path) catch {};
-            return err;
+            if (!mirror_on) return mirror_err;
+            // 镜像只是省带宽的优化：缺文件/没启动/403 时必须回退平台（带票据），
+            // 否则“开了镜像”反而比不开更容易失败。
+            const fallback = try self.platformDownloadUrl(arena, client, entry, &url_buf);
+            std.debug.print("[pek-zip] 镜像下载失败：{s}（{s}），回退平台下载：{s}\n", .{ @errorName(mirror_err), url, fallback });
+            url = fallback;
+            break :blk client.getToFile(url, &.{}, temp_path) catch |err| {
+                std.Io.Dir.cwd().deleteFile(self.io, temp_path) catch {};
+                return err;
+            };
         };
+        if ((status < 200 or status >= 300) and mirror_on) {
+            std.Io.Dir.cwd().deleteFile(self.io, temp_path) catch {};
+            const fallback = try self.platformDownloadUrl(arena, client, entry, &url_buf);
+            std.debug.print("[pek-zip] 镜像返回 HTTP {d}（{s}），回退平台下载：{s}\n", .{ status, url, fallback });
+            url = fallback;
+            status = client.getToFile(url, &.{}, temp_path) catch |err| {
+                std.Io.Dir.cwd().deleteFile(self.io, temp_path) catch {};
+                return err;
+            };
+        }
         defer std.Io.Dir.cwd().deleteFile(self.io, temp_path) catch {};
 
         if (status < 200 or status >= 300) return error.HttpStatus;
@@ -1057,6 +1136,24 @@ pub fn currentTarget() []const u8 {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "镜像模式：包地址按文件名重拼到镜像（不绕过镜像直连平台）" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const platform = "https://p.sc8.fun/components/ip2region-v4-2026.10-any.zip";
+    try testing.expectEqualStrings("ip2region-v4-2026.10-any.zip", componentFileName(platform));
+    try testing.expectEqualStrings("x.zip", componentFileName("https://a/b/x.zip?v=2#frag"));
+    try testing.expectEqualStrings("bare.zip", componentFileName("bare.zip"));
+
+    const mirror = "http://127.0.0.1:8899/ipdb";
+    try testing.expectEqualStrings(
+        "http://127.0.0.1:8899/ipdb/components/ip2region-v4-2026.10-any.zip",
+        try mirrorComponentUrl(arena, mirror, platform),
+    );
+}
 
 test "本地已有数据时启动立即可用（无网络）" {
     const gpa = testing.allocator;

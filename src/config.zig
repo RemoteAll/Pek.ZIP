@@ -48,6 +48,9 @@ pub const TEMPLATE =
     \\DownloadV6 = false
     \\# 组件目录缓存新鲜期（秒）：期间只读本地 catalog，不联网（0 = 每次都拉）
     \\CatalogMaxAge = 3600
+    \\# 单次 HTTP 请求总超时（毫秒；0 = 不限）。平台不可达时 sync 不会无限挂住；
+    \\# 下载大包可用更长预算（比如 600000）。
+    \\HttpTimeoutMs = 120000
     \\# —— 多应用 / 多节点共享（推荐）——
     \\# 同一台机器上的所有应用指向同一组目录：一次注册（StateDir）、一次下载（CacheDir），
     \\# 其余进程直接复用；并发启动由 CacheDir/.sync.lock 保证只有一个去下载。
@@ -82,6 +85,8 @@ pub const Config = struct {
     download_v6: bool = false,
     /// 组件目录缓存新鲜期（秒）：期间只读本地 catalog，不联网。0 = 每次都拉。
     catalog_max_age: u32 = 3600,
+    /// 单次 HTTP 请求总超时（毫秒；0 = 不限）。见 `http.zig` 顶部关于 std 源码的说明。
+    http_timeout_ms: u32 = 120_000,
     ca_file: ?[]u8 = null,
 
     pub fn deinit(self: *Config) void {
@@ -165,6 +170,8 @@ pub const Config = struct {
                 self.download_v6 = parseBool(value) orelse self.download_v6;
             } else if (std.mem.eql(u8, key, "CatalogMaxAge")) {
                 self.catalog_max_age = std.fmt.parseInt(u32, unquote(value), 10) catch self.catalog_max_age;
+            } else if (std.mem.eql(u8, key, "HttpTimeoutMs")) {
+                self.http_timeout_ms = std.fmt.parseInt(u32, unquote(value), 10) catch self.http_timeout_ms;
             } else if (std.mem.eql(u8, key, "CaFile")) {
                 const path = unquote(value);
                 if (path.len > 0) {

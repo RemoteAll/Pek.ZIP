@@ -575,6 +575,7 @@ pub const Manager = struct {
 
         var client = try http_mod.Client.init(self.io, self.gpa, self.cfg.ca_file);
         defer client.deinit();
+        client.timeout_ms = self.cfg.http_timeout_ms;
 
         const catalog_url = try std.fmt.allocPrint(arena, "{s}{s}", .{ self.cfg.store_url, CATALOG_PATH });
 
@@ -584,7 +585,7 @@ pub const Manager = struct {
             catalog_body = cached;
         } else {
             var response = client.getBytes(catalog_url, &.{}, MAX_CATALOG_BYTES) catch |err| {
-                self.setError("拉取组件目录失败：{s}；URL={s}（确认平台地址/网络/证书）", .{ @errorName(err), catalog_url });
+                self.setError("拉取组件目录失败：{s}；URL={s}（{s}）", .{ @errorName(err), catalog_url, fetchHint(err) });
                 return;
             };
             defer response.deinit(self.gpa);
@@ -600,7 +601,7 @@ pub const Manager = struct {
             if (self.cfg.pubkey.len > 0) {
                 const sig_url = try std.fmt.allocPrint(arena, "{s}.sig", .{catalog_url});
                 var sig_response = client.getBytes(sig_url, &.{}, MAX_SIGNATURE_BYTES) catch |err| {
-                    self.setError("拉取组件目录签名失败：{s}；URL={s}（检查证书/网络）", .{ @errorName(err), sig_url });
+                    self.setError("拉取组件目录签名失败：{s}；URL={s}（{s}）", .{ @errorName(err), sig_url, fetchHint(err) });
                     return;
                 };
                 defer sig_response.deinit(self.gpa);
@@ -692,6 +693,7 @@ pub const Manager = struct {
         if (self.cfg.store_url.len == 0) return error.NoStoreUrl;
         var client = try http_mod.Client.init(self.io, self.gpa, self.cfg.ca_file);
         defer client.deinit();
+        client.timeout_ms = self.cfg.http_timeout_ms;
         const auth = try self.authClient();
         auth.ensureLicense(self.cfg.store_url, &client) catch |err| switch (err) {
             error.Unsupported => return error.AuthUnsupported,
@@ -819,8 +821,21 @@ fn destroyShared(gpa: std.mem.Allocator, shared: *Shared) void {
     gpa.destroy(shared);
 }
 
+/// 网络失败的可定位提示：超时与普通传输失败必须能一眼分辨。
+fn fetchHint(err: anyerror) []const u8 {
+    return switch (err) {
+        error.Timeout => "超过 HttpTimeoutMs 未响应：平台可能不可达或过慢，可调大 Config/Ip.toml 的 HttpTimeoutMs",
+        else => "确认平台地址/网络/证书",
+    };
+}
+
 /// 本地数据文件命名约定（不区分大小写；与 Pek.IP 一致，另加纯真 `ip.gz`）。
-fn localPath(io: std.Io, arena: std.mem.Allocator, kind: Manager.Kind, data_dir: []const u8) !?[]const u8 {
+fn localPath(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    kind: Manager.Kind,
+    data_dir: []const u8,
+) !?[]const u8 {
     switch (kind) {
         .xdb_v4 => {
             for ([_][]const u8{ "ip2region_v4.xdb", "ip2region.xdb" }) |name| {

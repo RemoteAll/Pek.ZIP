@@ -236,13 +236,14 @@ fn run(io: std.Io, gpa: std.mem.Allocator, argv: []const [:0]const u8) !u8 {
 fn printStatus(io: std.Io, manager: *pek.Manager) !void {
     var line: [1024]u8 = undefined;
     const cfg = manager.cfg;
-    try stdout(io, try std.fmt.bufPrint(&line, "StoreUrl : {s}\nDataDir  : {s}\nCacheDir : {s}\nPubKey   : {s}\n下载IPv6 : {}\n目录TTL  : {d}s（0 = 每次都拉）\n", .{
+    try stdout(io, try std.fmt.bufPrint(&line, "StoreUrl : {s}\nDataDir  : {s}\nCacheDir : {s}\nPubKey   : {s}\n下载IPv6 : {}\n目录TTL  : {d}s（0 = 每次都拉）\n请求超时 : {d}ms（0 = 不限）\n", .{
         cfg.store_url,
         cfg.data_dir,
         cfg.cache_dir,
         if (cfg.pubkey.len == 0) "(未配置：不校验目录签名)" else cfg.pubkey,
         cfg.download_v6,
         cfg.catalog_max_age,
+        cfg.http_timeout_ms,
     }));
 
     for ([_]pek.Dataset{ .ip2region_v4, .ip2region_v6, .world, .asn }) |dataset| {

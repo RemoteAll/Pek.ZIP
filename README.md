@@ -65,6 +65,7 @@ StateDir   = "Data/IpClient"      # 客户端身份（授权流程预留）
 AutoEnroll = true                 # 预留
 DownloadV6 = false                # IPv6 xdb 约 37 MiB，默认不下载
 CatalogMaxAge = 3600              # 组件目录缓存新鲜期（秒）；期间只读本地，0 = 每次都拉
+HttpTimeoutMs = 120000            # 单次请求总超时（毫秒；0 = 不限）
 # CaFile   = "Config/ca.pem"      # 内网/自签平台的自定义根证书
 ```
 
@@ -76,6 +77,15 @@ CatalogMaxAge = 3600              # 组件目录缓存新鲜期（秒）；期�
 - **同机只下一次**：共享 `CacheDir` 时由 `{CacheDir}/.sync.lock` 独占创建保证一个进程去下载，
   其余进程直接复用；崩溃残留超 10 分钟自动视为陈旧。
 - **定时更新**：由任一个常驻进程（或计划任务）定时跑 `zpk sync` 即可，其余应用启动只读共享缓存。
+
+### 请求超时（为什么自己实现）
+
+Zig 0.17.1 的 `std.http.Client` **没有任何生效的超时**：
+`ConnectTcpOptions.timeout` 虽然声明了，但 `connectTcpOptions` 从不读它（内部 `host.connect` 只用 `.mode`）；
+而底层 `Io.net.ConnectOptions.timeout`、`Socket.sendTimeout/receiveTimeout` 其实都是生效的——只是 HTTP 层没接。
+
+所以 `src/http.zig` 自己做了看门狗：请求跑在独立线程，主线程最多等 `HttpTimeoutMs` 就返回 `Error.Timeout`，
+专门覆盖「连上了但服务器不回数据」这类挂死（实测：本地启一个只 accept 不回包的监听，1200ms 配置 → **1.32s 返回 Timeout**）。
 
 数据文件命名（不区分大小写，与 Pek.IP 一致）：
 

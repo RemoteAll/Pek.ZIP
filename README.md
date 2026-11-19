@@ -198,3 +198,5 @@ sequenceDiagram
 
 - 接续与决策：`docs/项目接续指南.md`、`docs/决策记录.md`
 - 一键回归：`tools/regression.ps1`（构建 → 单测 → CLI 自检 → 真实数据）
+- 升级链路端到端：`tools/verify-sync-e2e.ps1`（起本地假平台，验证「平台发新版 → 下载 → 安装 → 旧版清理 → 查询用上新数据」；
+  需要 `python` 与一个本地端口，故不进一键回归）

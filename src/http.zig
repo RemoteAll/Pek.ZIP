@@ -342,3 +342,42 @@ test "超时：慢任务被取消并收回，调用方立即返回" {
     try std.testing.expect(timed_out);
     try std.testing.expect(elapsed_ms < 250); // 没被 300ms 的任务拖住
 }
+
+test "超时取消可重复：连续 30 次超时不留线程、不崩、不泄漏" {
+    // 背景：`zig build test` 曾两次在「刚重编后的第一次」静默退出（无 panic 文本），
+    // 之后 `zig test` 连跑 3 次、`zig build test` 连跑 4 次全绿，一直没能复现。
+    // 单次用例覆盖不到偶发时序，所以这里把「起任务 → 超时 → cancel 回收」重复 30 次：
+    // 真有时序问题，本用例会以崩溃/泄漏/变慢暴露出来（regression 每次都跑）。
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const Case = struct {
+        sync: Sync = .{},
+        io: std.Io,
+        delay_ms: u32 = 120,
+        finished: bool = false,
+
+        fn worker(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            std.Io.Timeout.sleep(msTimeout(self.delay_ms), self.io) catch {};
+            self.sync.mutex.lock(self.io) catch return;
+            self.finished = true;
+            self.sync.done = true;
+            self.sync.cond.signal(self.io);
+            self.sync.mutex.unlock(self.io);
+        }
+    };
+
+    var round: usize = 0;
+    while (round < 30) : (round += 1) {
+        var case = Case{ .io = io };
+        const start = std.Io.Clock.real.now(io).nanoseconds;
+        const timed_out = runWithTimeout(io, &case.sync, @ptrCast(&case), Case.worker, 10);
+        const elapsed_ms = @divTrunc(std.Io.Clock.real.now(io).nanoseconds - start, std.time.ns_per_ms);
+        try std.testing.expect(timed_out);
+        // 取消必须真的把任务回收（cancel 会 join），所以耗时应接近超时值而不是任务时长
+        try std.testing.expect(elapsed_ms < 100);
+    }
+}

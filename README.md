@@ -59,11 +59,11 @@ zpk mkxdb out.xdb                    # 生成最小 xdb（测试/演示）
 
 ```toml
 StoreUrl   = "https://p.sc8.fun"   # Pek.RPanlServer 平台（固定，一般不改）
-PubKey     = ""                   # 平台 Ed25519 公钥；非空 = 强制验签（v0.1 未实现 → 拒绝下载）
+PubKey     = ""                   # 留空 = 注册时从平台响应 TOFU 学习公钥并落盘；之后目录强制验签
 DataDir    = "data"               # 本地数据目录（xdb/mmdb/ip.gz）
 CacheDir   = "Data/IpCache"       # 下载缓存（{id}/{version}/ + .pek-zip.json）
-StateDir   = "Data/IpClient"      # 客户端身份（授权流程预留）
-AutoEnroll = true                 # 预留
+StateDir   = "Data/IpClient"      # 客户端身份（install.id / client.key / pubkey.txt / License）
+AutoEnroll = true                 # 未批准时自动向平台申请授权（票据下载）
 DownloadV6 = false                # IPv6 xdb 约 37 MiB，默认不下载
 CatalogMaxAge = 3600              # 组件目录缓存新鲜期（秒）；期间只读本地，0 = 每次都拉
 HttpTimeoutMs = 120000            # 单次请求总超时（毫秒；0 = 不限）
@@ -74,7 +74,8 @@ AutoUpdateMinutes = 0             # 后台定时检查更新（分钟；0 = 关�
 ### 带宽与更新策略
 
 - **目录不重复拉**：`catalog.json` 落到 `{CacheDir}/.catalog.json`，`CatalogMaxAge` 内直接用本地缓存
-  （配了 `PubKey` 时连缓存一起验签；时钟回拨/缓存损坏一律按不新鲜处理）。
+  （**只要拿到过可信公钥就连缓存一起验签**：`PubKey` 非空用配置的，留空用注册时 TOFU 学到的平台公钥；
+  时钟回拨/缓存损坏一律按不新鲜处理）。
 - **包只在新版本时下**：`zpk sync` 比对目录版本与本地已装版本，同版本/更低一律跳过。
 - **同机只下一次**：共享 `CacheDir` 时由 `{CacheDir}/.sync.lock` 独占创建保证一个进程去下载，
   其余进程直接复用；崩溃残留超 10 分钟自动视为陈旧。
@@ -181,7 +182,7 @@ sequenceDiagram
 
 **数据文件不入库**（`.gitignore`）：由使用方按各自许可获取，或上传到 Pek.RPanlServer 组件源（分类 `ip-database`）。
 
-## 与两个参考项目的差异（v0.1）
+## 与两个参考项目的差异
 
 | 项 | Pek.IP | Pek.ZIP |
 |----|--------|---------|
@@ -189,10 +190,10 @@ sequenceDiagram
 | 查询分配 | 返回 `String` | **零分配**（切片借用 mmap） |
 | 文件加载 | 全量读入内存 | **mmap 只读**（可 `no_mmap` 退化） |
 | 纯真 QQWry | 不支持 | **支持**（GBK 解码 + gzip） |
-| 在线 API | 不支持 | 解析逻辑待接（DH.NIP 的 4 种格式已调研，v0.2） |
-| 下载授权 | Ed25519 自动注册 + 票据 | **未实现**（配 `PubKey` 时明确拒绝下载，不静默放行） |
-| 请求超时 | 60 s | **未设置**（std 0.17 `Client` 未暴露 per-request 超时；下载在后台线程，不影响查询） |
-| DB-IP CSV 转换 | 无 | 待接（`gb2312.Encoder` 已就绪） |
+| 在线 API | 不支持 | **支持**（ip-api / 腾讯 / 百度 / 高德 四格式，`zpk online`） |
+| 下载授权 | Ed25519 自动注册 + 票据 | **支持**（Ed25519 自动注册 + 票据；目录签名强制验签：配置公钥或注册时 TOFU） |
+| 请求超时 | 60 s | **支持**（`HttpTimeoutMs` 默认 120 s；原生 `io.concurrent` + `Future.cancel`，非自造看门狗） |
+| DB-IP CSV 转换 | 无 | **支持**（`zpk csv2db` → 纯真格式，GBK 码表由 `tools/gen_gbk_table.ps1` 生成） |
 
 ## 文档
 

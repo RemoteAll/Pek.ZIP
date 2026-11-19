@@ -591,14 +591,15 @@ pub const Manager = struct {
         const json_path = try std.fs.path.join(arena, &.{ self.cfg.cache_dir, CATALOG_CACHE_JSON });
         const body = readSmallFile(self.io, arena, json_path, MAX_CATALOG_BYTES) orelse return null;
 
-        // 配了 PubKey 就必须连缓存一起验签：否则改缓存文件即可绕过验签
-        if (self.cfg.pubkey.len > 0) {
+        // 有可信公钥（配置的 PubKey 或注册时 TOFU 学到的平台公钥）就必须连缓存一起验签：
+        // 否则改缓存文件即可绕过验签
+        if (self.catalogVerifyKey()) |verify_key| {
             const sig_path = try std.fs.path.join(arena, &.{ self.cfg.cache_dir, CATALOG_CACHE_SIG });
             const sig_text = readSmallFile(self.io, arena, sig_path, MAX_SIGNATURE_BYTES) orelse {
                 std.debug.print("[pek-zip] 本地目录缓存缺签名（{s}），改走联网刷新\n", .{sig_path});
                 return null;
             };
-            auth_mod.verifyBase64(self.cfg.pubkey, body, std.mem.trim(u8, sig_text, " \t\r\n")) catch |err| {
+            auth_mod.verifyBase64(verify_key, body, std.mem.trim(u8, sig_text, " \t\r\n")) catch |err| {
                 std.debug.print("[pek-zip] 本地目录缓存签名校验失败：{s}，改走联网刷新\n", .{@errorName(err)});
                 return null;
             };
@@ -673,9 +674,10 @@ pub const Manager = struct {
                 return false;
             }
 
-            // 配了 PubKey 就强制验签（目录被篡改宁可不可用）
+            // 有可信公钥就必须验签（目录被篡改宁可不可用）：
+            // 配置的 PubKey 优先；留空时用注册时 TOFU 学到的平台公钥（否则留空＝完全不验签，TOFU 形同虚设）
             var sig_text: ?[]const u8 = null;
-            if (self.cfg.pubkey.len > 0) {
+            if (self.catalogVerifyKey()) |verify_key| {
                 const sig_url = try std.fmt.allocPrint(arena, "{s}.sig", .{catalog_url});
                 var sig_response = client.getBytes(sig_url, &.{}, MAX_SIGNATURE_BYTES) catch |err| {
                     self.setError("拉取组件目录签名失败：{s}；URL={s}（{s}）", .{ @errorName(err), sig_url, fetchHint(err) });
@@ -687,10 +689,18 @@ pub const Manager = struct {
                     return false;
                 }
                 sig_text = std.mem.trim(u8, sig_response.body, " \t\r\n");
-                auth_mod.verifyBase64(self.cfg.pubkey, response.body, sig_text.?) catch |err| {
-                    self.setError("组件目录签名校验失败：{s}（PubKey 或目录可能被篡改；URL={s}）", .{ @errorName(err), catalog_url });
+                auth_mod.verifyBase64(verify_key, response.body, sig_text.?) catch |err| {
+                    self.setError("组件目录签名校验失败：{s}（公钥来源 {s}，目录可能被篡改；URL={s}）", .{
+                        @errorName(err), self.verifyKeySourceText(), catalog_url,
+                    });
                     return false;
                 };
+                // 必须拷进 arena：`sig_response` 的 defer 在本 if 块结束就释放了，
+                // 直接留着 `sig_text` 会变成悬垂指针（实测把 'UUUU…' 写进了缓存，
+                // 导致下次启动缓存验签必失败、TTL 形同失效、每次都要重拉 85 KB 目录）。
+                sig_text = try arena.dupe(u8, sig_text.?);
+            } else {
+                std.debug.print("[pek-zip] 尚无可信公钥（未配 PubKey 且还没注册过），本次目录不验签；注册成功后自动强制验签\n", .{});
             }
             writeCatalogCache(self.io, arena, self.cfg.cache_dir, response.body, sig_text);
             // response 马上 deinit，正文必须拷进 arena
@@ -746,6 +756,37 @@ pub const Manager = struct {
             }
         }
         return downloaded;
+    }
+
+    /// 目录验签公钥来源。
+    pub const VerifyKeySource = enum { configured, tofu, none };
+
+    /// 目录验签用的公钥：配置的 `PubKey` 优先；留空时用注册时 TOFU 学到的平台公钥。
+    ///
+    /// 为什么必须有 TOFU 分支：配置注释写着「留空 = 注册时学习公钥并落盘固定，不需要每个应用都配」，
+    /// 但若验签只看 `cfg.pubkey`，留空就等于**完全不验签**（改目录 + 换包即可绕过），TOFU 形同虚设。
+    /// 返回 null 只发生在「既没配 PubKey、也还没注册过」的首次联网 —— 注册成功后自动开始强制验签。
+    pub fn catalogVerifyKey(self: *Manager) ?[]const u8 {
+        if (self.cfg.pubkey.len > 0) return self.cfg.pubkey;
+        const auth = self.authClient() catch |err| {
+            std.debug.print("[pek-zip] 读取授权身份失败（{s}），本次无法用 TOFU 公钥校验目录签名\n", .{@errorName(err)});
+            return null;
+        };
+        return auth.platformPubKeyHex();
+    }
+
+    /// 公钥来源（给 `zpk status` 与错误文案用）。
+    pub fn verifyKeySource(self: *Manager) VerifyKeySource {
+        if (self.cfg.pubkey.len > 0) return .configured;
+        return if (self.catalogVerifyKey() != null) .tofu else .none;
+    }
+
+    pub fn verifyKeySourceText(self: *Manager) []const u8 {
+        return switch (self.verifyKeySource()) {
+            .configured => "配置的 PubKey",
+            .tofu => "TOFU 学到的平台公钥",
+            .none => "无公钥（不验签）",
+        };
     }
 
     /// 懒加载授权客户端（身份文件在 `StateDir`，首次创建后持久化）。
@@ -1157,6 +1198,62 @@ test "组件目录缓存新鲜期（CatalogMaxAge）" {
     try testing.expect(!catalogCacheFresh(io, arena, dir, 3600));
 
     std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+}
+
+test "目录缓存验签：留空 PubKey 时用 TOFU 学到的平台公钥（坏签名不被信任）" {
+    const gpa = testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const base = "G:/Code/Zig/Pek.ZIP/.zig-cache/tofutest";
+    std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, base ++ "/Data/IpClient");
+    try std.Io.Dir.cwd().createDirPath(io, base ++ "/Data/IpCache");
+
+    // 模拟「注册时 TOFU 学到平台公钥」：只把公钥写进 StateDir，配置里的 PubKey 保持空
+    const seed: [32]u8 = @splat(13);
+    const key_pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    const pk = key_pair.public_key.toBytes();
+    var pk_hex: [64]u8 = undefined;
+    const hex_chars = "0123456789abcdef";
+    for (pk, 0..) |byte, i| {
+        pk_hex[i * 2] = hex_chars[byte >> 4];
+        pk_hex[i * 2 + 1] = hex_chars[byte & 0x0f];
+    }
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = base ++ "/Data/IpClient/pubkey.txt",
+        .data = &pk_hex,
+    });
+
+    const manager = try Manager.start(io, gpa, base, .{ .background = false });
+    defer manager.destroy();
+
+    // 配置留空 + 存在 TOFU 公钥 → 必须判定为「要验签」（旧实现这里是直接跳过验签）
+    try testing.expectEqualStrings("", manager.cfg.pubkey);
+    try testing.expect(manager.verifyKeySource() == .tofu);
+    try testing.expectEqualStrings(&pk_hex, manager.catalogVerifyKey().?);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // 正确签名 → 缓存可用
+    const body = "{\"components\":[]}";
+    const signature = try key_pair.sign(body, null);
+    var sig_buf: [128]u8 = undefined;
+    const sig_text = std.base64.standard.Encoder.encode(&sig_buf, &signature.toBytes());
+    writeCatalogCache(io, arena, manager.cfg.cache_dir, body, sig_text);
+    try testing.expectEqualStrings(body, (try manager.loadCachedCatalog(arena)).?);
+
+    // 正文被改（签名不动）→ 缓存不可信，返回 null 触发联网重拉（撤掉修复后这里会拿到被篡改的目录）
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = base ++ "/Data/IpCache/.catalog.json",
+        .data = "{\"components\":[{\"id\":\"evil\"}]}",
+    });
+    try testing.expect((try manager.loadCachedCatalog(arena)) == null);
+
+    std.Io.Dir.cwd().deleteTree(io, base) catch {};
 }
 
 test "并发读取期间热替换不崩溃（引用计数）" {

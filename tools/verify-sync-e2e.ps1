@@ -111,6 +111,19 @@ try {
     # 6) the freshly installed data must actually be used by lookups (hot swap works)
     $code3 = Invoke-Zpk @('lookup', '--base', "$root\base", '114.114.114.114') "$root\lookup.txt"
     $lk = Get-Content "$root\lookup.txt" -Encoding UTF8 -Raw
+
+    # 7) catalog cache must be reusable inside the TTL window (no network, no re-download).
+    #    This guards a real bug found on 2026-11-19: the sig slice was freed before being
+    #    cached (dangling pointer -> garbage sig -> cache never trusted -> 85 KB refetch every run).
+    $cfg_ttl = $cfg -replace 'CatalogMaxAge = 0', 'CatalogMaxAge = 3600'
+    [System.IO.File]::WriteAllText("$root\base\Config\Ip.toml", $cfg_ttl, (New-Object System.Text.UTF8Encoding($false)))
+    $catalog_before = (Get-FileHash "$root\srv\components\catalog.json" -Algorithm SHA256).Hash
+    $code4 = Invoke-Zpk @('sync', '--base', "$root\base") "$root\sync3.txt"
+    $r3 = Get-Content "$root\sync3.txt" -Encoding UTF8 -Raw
+    # ASCII markers only: PS 5.1 decodes native UTF-8 stdout as ANSI, so Chinese text in the
+    # captured file is mojibake. '3600s' only appears in the "reuse cached catalog" line;
+    # 'BadSignature' only appears when cache verification failed.
+    $cached_ok = ($r3 -match '3600s') -and -not ($r3 -match 'BadSignature')
 } finally {
     Stop-ServerOnPort $port
     Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue
@@ -135,8 +148,9 @@ Assert $v11 'upgrade-to-v2' '2026.11 installed by second sync'
 Assert (-not $v10_after) 'clean-old-version' '2026.10 removed (keep = 1)'
 Assert ([bool]($r2 -match '2026\.11')) 'detect-newer' 'second sync mentions 2026.11'
 Assert ([bool]($lk -match 'Guangdong')) 'lookup-uses-new-data' 'lookup returns v2 region (Guangdong), not v1 (Jiangsu)'
+Assert $cached_ok 'catalog-cache-reused' 'third sync reuses cached catalog (no refetch, no failed signature)'
 
-Write-Output ("zpk exit codes (expected 1 for sync: fake catalog ships 1 of 4 datasets): {0}, {1}; lookup={2}" -f $code1, $code2, $code3)
+Write-Output ("zpk exit codes (expected 1 for sync: fake catalog ships 1 of 4 datasets): {0}, {1}; lookup={2}; cached-sync={3}" -f $code1, $code2, $code3, $code4)
 if ($fail -gt 0) {
     Write-Output "=== RESULT: FAIL ($fail) ==="
     exit 1

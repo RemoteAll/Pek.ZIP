@@ -242,11 +242,19 @@ fn run(io: std.Io, gpa: std.mem.Allocator, argv: []const [:0]const u8) !u8 {
 fn printStatus(io: std.Io, manager: *pek.Manager) !void {
     var line: [1024]u8 = undefined;
     const cfg = manager.cfg;
+    // 公钥留空时也会用注册时 TOFU 学到的平台公钥验签，这里必须如实显示，
+    // 否则运维会以为「没验签」而重复排查。
+    const pubkey_desc: []const u8 = if (cfg.pubkey.len > 0)
+        cfg.pubkey
+    else switch (manager.verifyKeySource()) {
+        .tofu => "(留空：用注册时 TOFU 学到的平台公钥强制验签)",
+        else => "(未配置且尚未注册：本次不校验目录签名)",
+    };
     try stdout(io, try std.fmt.bufPrint(&line, "StoreUrl : {s}\nDataDir  : {s}\nCacheDir : {s}\nPubKey   : {s}\n下载IPv6 : {}\n目录TTL  : {d}s（0 = 每次都拉）\n请求超时 : {d}ms（0 = 不限）\n定时检查 : {d}min（0 = 关闭）\n", .{
         cfg.store_url,
         cfg.data_dir,
         cfg.cache_dir,
-        if (cfg.pubkey.len == 0) "(未配置：不校验目录签名)" else cfg.pubkey,
+        pubkey_desc,
         cfg.download_v6,
         cfg.catalog_max_age,
         cfg.http_timeout_ms,

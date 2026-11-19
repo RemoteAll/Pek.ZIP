@@ -800,8 +800,8 @@ pub const Manager = struct {
             } else |err| {
                 const hint = switch (err) {
                     error.AuthPending => "客户端已注册但等待平台批准：面板「分发中心 → IP 授权」点「批准」后重跑 zpk sync",
-                    error.AuthRevoked => "客户端已被平台吐销：面板「IP 授权」页恢复并重新批准",
-                    error.Denied => "平台拒给授权（检查 StateDir 里的 installId 是否被重置/公钥不匹配）",
+                    error.AuthRevoked => "客户端已被平台吊销：面板「IP 授权」页恢复并重新批准",
+                    error.Denied => "平台拒绝了这次下载（看上一条「平台返回错误」的 message：常见是未批准 / 今日下载配额用尽 / 身份不匹配）",
                     error.BadSignature => "签名校验失败（配置的 PubKey 与平台不一致，或本地身份文件损坏）",
                     else => "",
                 };

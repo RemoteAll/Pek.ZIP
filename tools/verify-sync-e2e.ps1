@@ -148,6 +148,18 @@ try {
     [System.IO.File]::WriteAllText("$root\base3\Config\Ip.toml", $cfg_fallback, (New-Object System.Text.UTF8Encoding($false)))
     $code6 = Invoke-Zpk @('sync', '--base', "$root\base3") "$root\sync5.txt"
     $fallback_installed = Test-Path "$root\base3\cache\ip2region-v4\2026.11"
+
+    # 10) auto-discovery: MirrorUrl left empty, MirrorProbeUrl points at the fake agent -> must install.
+    New-Item -ItemType Directory -Force "$root\base4\Config", "$root\base4\data" | Out-Null
+    Set-Content "$root\base4\data\dbip-city-lite.mmdb" -Value 'placeholder' -Encoding ascii
+    Set-Content "$root\base4\data\dbip-asn-lite.mmdb" -Value 'placeholder' -Encoding ascii
+    $cfg_probe = "StoreUrl = `"http://127.0.0.1:1`"`nMirrorProbeUrl = `"http://127.0.0.1:$port/ipdb`"`nPubKey = `"`"`nAutoEnroll = false`nDownloadV6 = false`nDataDir = `"data`"`nCacheDir = `"cache`"`nStateDir = `"client`"`nCatalogMaxAge = 0`nHttpTimeoutMs = 5000`n"
+    [System.IO.File]::WriteAllText("$root\base4\Config\Ip.toml", $cfg_probe, (New-Object System.Text.UTF8Encoding($false)))
+    $code7 = Invoke-Zpk @('sync', '--base', "$root\base4") "$root\sync6.txt"
+    $probe_installed = Test-Path "$root\base4\cache\ip2region-v4\2026.11"
+    $r6 = Get-Content "$root\sync6.txt" -Encoding UTF8 -Raw
+    # ASCII marker: the discovery line is the only place printing "HTTP 200" during this sync
+    $probe_logged = [bool]($r6 -match 'HTTP 200')
 } finally {
     Stop-ServerOnPort $port
     Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue
@@ -175,8 +187,10 @@ Assert ([bool]($lk -match 'Guangdong')) 'lookup-uses-new-data' 'lookup returns v
 Assert $cached_ok 'catalog-cache-reused' 'third sync reuses cached catalog (no refetch, no failed signature)'
 Assert $mirror_installed 'mirror-mode' 'sync installs from MirrorUrl while StoreUrl is a dead port'
 Assert $fallback_installed 'mirror-fallback' 'missing mirror falls back to StoreUrl and still installs'
+Assert $probe_installed 'mirror-autodetect' 'empty MirrorUrl + MirrorProbeUrl finds the local agent and installs'
+Assert $probe_logged 'mirror-autodetect-log' 'discovery line logged (HTTP 200 from probe)'
 
-Write-Output ("zpk exit codes (expected 1 for sync: fake catalog ships 1 of 4 datasets): {0}, {1}; lookup={2}; cached-sync={3}; mirror-sync={4}; fallback-sync={5}" -f $code1, $code2, $code3, $code4, $code5, $code6)
+Write-Output ("zpk exit codes (expected 1 for sync: fake catalog ships 1 of 4 datasets): {0}, {1}; lookup={2}; cached-sync={3}; mirror-sync={4}; fallback-sync={5}; probe-sync={6}" -f $code1, $code2, $code3, $code4, $code5, $code6, $code7)
 if ($fail -gt 0) {
     Write-Output "=== RESULT: FAIL ($fail) ==="
     exit 1

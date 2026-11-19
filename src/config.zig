@@ -28,6 +28,9 @@ const fsutil = @import("fsutil.zig");
 /// 默认 RPanelServer 平台地址（固定；一般无需修改）。
 pub const DEFAULT_STORE_URL = "https://p.sc8.fun";
 
+/// 默认自动探测的镜像地址（本机 RAgent 的 `/ipdb`，端口与其 `LocalPort` 默认值一致）。
+pub const DEFAULT_MIRROR_PROBE_URL = "http://127.0.0.1:5501/ipdb";
+
 /// 内置配置模板（首次运行自动落盘）。
 pub const TEMPLATE =
     \\# Pek.ZIP 配置（首次运行自动生成；只改需要的那几行）
@@ -59,6 +62,9 @@ pub const TEMPLATE =
     \\# 配了之后目录与安装包都从镜像拿（目录签名仍用平台公钥校，镜像只转发不重签）。
     \\# 好处：同一台机器的多个进程只让镜像下一次；镜像未就绪时自动回落平台。
     \\# MirrorUrl = "http://127.0.0.1:8899/ipdb"
+    \\# 自动发现：MirrorUrl 留空时探测这个地址（默认本机 RAgent 5501/ipdb，返回 2xx 就用）；
+    \\# 设为空串 = 关闭自动探测；探测超时 800ms，且只在真要联网时探一次。
+    \\MirrorProbeUrl = "http://127.0.0.1:5501/ipdb"
     \\# —— 多应用 / 多节点共享（推荐）——
     \\# 同一台机器上的所有应用指向同一组目录：一次注册（StateDir）、一次下载（CacheDir），
     \\# 其余进程直接复用；并发启动由 CacheDir/.sync.lock 保证只有一个去下载。
@@ -86,8 +92,10 @@ pub const Config = struct {
     base: []u8,
     store_url: []u8,
     pubkey: []u8,
-    /// 本地镜像根（如 `http://127.0.0.1:8899/ipdb`；空 = 直连平台）。
+    /// 本地镜像根（如 `http://127.0.0.1:8899/ipdb`；空 = 尝试自动探测）。
     mirror_url: []u8,
+    /// 自动探测地址（默认本机 RAgent `http://127.0.0.1:5501/ipdb`；空串 = 关闭探测）。
+    mirror_probe_url: []u8,
     data_dir: []u8,
     cache_dir: []u8,
     state_dir: []u8,
@@ -107,6 +115,7 @@ pub const Config = struct {
         gpa.free(self.store_url);
         gpa.free(self.pubkey);
         gpa.free(self.mirror_url);
+        gpa.free(self.mirror_probe_url);
         gpa.free(self.data_dir);
         gpa.free(self.cache_dir);
         gpa.free(self.state_dir);
@@ -122,6 +131,7 @@ pub const Config = struct {
             .store_url = gpa.dupe(u8, DEFAULT_STORE_URL) catch return Error.OutOfMemory,
             .pubkey = gpa.dupe(u8, "") catch return Error.OutOfMemory,
             .mirror_url = gpa.dupe(u8, "") catch return Error.OutOfMemory,
+            .mirror_probe_url = gpa.dupe(u8, DEFAULT_MIRROR_PROBE_URL) catch return Error.OutOfMemory,
             .data_dir = undefined,
             .cache_dir = undefined,
             .state_dir = undefined,
@@ -171,6 +181,8 @@ pub const Config = struct {
                 try self.setPubKey(unquote(value));
             } else if (std.mem.eql(u8, key, "MirrorUrl")) {
                 try self.setMirrorUrl(unquote(value));
+            } else if (std.mem.eql(u8, key, "MirrorProbeUrl")) {
+                try self.setProbeUrl(unquote(value));
             } else if (std.mem.eql(u8, key, "DataDir")) {
                 const path = unquote(value);
                 if (path.len > 0) try self.setPath(&self.data_dir, path);
@@ -222,13 +234,22 @@ pub const Config = struct {
         self.pubkey = dup;
     }
 
-    /// 镜像地址去掉尾部 `/`（空串 = 直连平台）。
+    /// 镜像地址去掉尾部 `/`（空串 = 自动探测）。
     fn setMirrorUrl(self: *Config, value: []const u8) Error!void {
         var trimmed = value;
         while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') trimmed = trimmed[0 .. trimmed.len - 1];
         const dup = self.gpa.dupe(u8, trimmed) catch return Error.OutOfMemory;
         self.gpa.free(self.mirror_url);
         self.mirror_url = dup;
+    }
+
+    /// 探测地址同样去尾部 `/`；**显式空串 = 关闭探测**（与“没写这行”不同：没写保持默认）。
+    fn setProbeUrl(self: *Config, value: []const u8) Error!void {
+        var trimmed = value;
+        while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') trimmed = trimmed[0 .. trimmed.len - 1];
+        const dup = self.gpa.dupe(u8, trimmed) catch return Error.OutOfMemory;
+        self.gpa.free(self.mirror_probe_url);
+        self.mirror_probe_url = dup;
     }
 
     fn resolve(self: *Config, value: []const u8) Error![]u8 {

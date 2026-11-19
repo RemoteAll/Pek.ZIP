@@ -68,7 +68,8 @@ DownloadV6 = false                # IPv6 xdb 约 37 MiB，默认不下载
 CatalogMaxAge = 3600              # 组件目录缓存新鲜期（秒）；期间只读本地，0 = 每次都拉
 HttpTimeoutMs = 120000            # 单次请求总超时（毫秒；0 = 不限）
 AutoUpdateMinutes = 0             # 后台定时检查更新（分钟；0 = 关闭，常驻服务推荐 360）
-# MirrorUrl = "http://127.0.0.1:8899/ipdb"  # 本机镜像（见下），留空 = 直连平台
+# MirrorUrl = "http://127.0.0.1:8899/ipdb"  # 本机镜像（留空 = 自动探测 MirrorProbeUrl）
+MirrorProbeUrl = "http://127.0.0.1:5501/ipdb"  # 自动探测地址（空串 = 关闭探测）
 # CaFile   = "Config/ca.pem"      # 内网/自签平台的自定义根证书
 ```
 
@@ -80,9 +81,10 @@ AutoUpdateMinutes = 0             # 后台定时检查更新（分钟；0 = 关�
 - **包只在新版本时下**：`zpk sync` 比对目录版本与本地已装版本，同版本/更低一律跳过。
 - **同机只下一次**：共享 `CacheDir` 时由 `{CacheDir}/.sync.lock` 独占创建保证一个进程去下载，
   其余进程直接复用；崩溃残留超 10 分钟自动视为陈旧。
-- **可从本机镜像取（可选）**：服务器装了 **Pek.RAgent** 时，把 `MirrorUrl` 指到它的 `/ipdb`
-  （如 `http://127.0.0.1:5501/ipdb`；布局是 `/ipdb/catalog.json` + `/ipdb/components/*.zip`），
-  目录与安装包都从本机取；镜像只转发平台原始字节，**验签仍用平台公钥**。
+- **可从本机镜像取（默认自动发现）**：服务器装了 **Pek.RAgent** 时，客户端会**自动探测**
+  `http://127.0.0.1:5501/ipdb`（它的 `/ipdb`；探测超时 800 ms，只在真要联网时探一次，命中即用、未命中直连平台）。
+  要改端口/地址就用 `MirrorUrl` 显式指定，或改 `MirrorProbeUrl`；置 `MirrorProbeUrl = ""` 可关闭自动探测。
+  镜像布局是 `/ipdb/catalog.json` + `/ipdb/components/*.zip`，只转发平台原始字节，**验签仍用平台公钥**。
   镜像缺文件/没启动/返回非 2xx 时**自动回退平台**，不会因开镜像而同步失败。
   RAgent 侧开 `IpdbAutoEnroll` 后会以独立身份向平台注册（首次需在「分发中心 → IP 授权」批准一次），
   之后它就自己取票下包，本机各应用零配置、不再各自连平台。

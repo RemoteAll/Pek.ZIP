@@ -48,6 +48,8 @@ pub const DATASET_GEOLITE2_CITY = "geolite2-city";
 pub const DATASET_GEOLITE2_ASN = "geolite2-asn";
 
 const CATALOG_PATH = "/components/catalog.json";
+/// 自动探测本机镜像的超时（毫秒）：探不到就当没有，不能拖慢启动/同步。
+const MIRROR_PROBE_TIMEOUT_MS: u32 = 800;
 
 /// 取 URL 的文件名（去掉目录、查询串与片段）。
 pub fn componentFileName(url: []const u8) []const u8 {
@@ -288,6 +290,10 @@ pub const Manager = struct {
     lookups: std.atomic.Value(u64) = .init(0),
     /// 下载授权客户端（懒加载；零身份自动注册，首次下载时创建）。
     auth: ?auth_mod.AuthClient = null,
+    /// 自动探测到的本机镜像根（`null` = 尚未探测；空串不可能，没探到就一直是 null）。
+    mirror_detected: ?[]u8 = null,
+    /// 是否已尝试过探测（探测只做一次，无论成败）。
+    mirror_probed: bool = false,
     /// 被替换下来的旧定位器：**只延后释放**（廉价 hazard pointer 替代），
     /// 运行期不销毁，避免「读方刚拿到指针就被销毁」的竞态；替换次数很少（启动一次 + 手动 sync）。
     retired: std.ArrayList(*Shared) = .empty,
@@ -387,6 +393,7 @@ pub const Manager = struct {
         self.swap_lock.unlock();
 
         const gpa = self.gpa;
+        if (self.mirror_detected) |m| gpa.free(m);
         self.cfg.deinit();
         gpa.destroy(self);
     }
@@ -671,10 +678,12 @@ pub const Manager = struct {
         defer client.deinit();
         client.timeout_ms = self.cfg.http_timeout_ms;
 
-        const catalog_url = if (self.cfg.mirror_url.len > 0)
+        // 镜像根：配置了就用配置的；没配就**自动探测本机 RAgent**（探测一次，失败即直连平台）。
+        const mirror = self.resolveMirror(&client);
+        const catalog_url = if (mirror) |root|
             // 镜像根就是 `/ipdb`（RAgent 的布局：`/ipdb/catalog.json` + `/ipdb/components/*.zip`），
             // 字节与平台一致，所以验签仍然对着平台公钥（镜像只转发不重签）。
-            try std.fmt.allocPrint(arena, "{s}/catalog.json", .{self.cfg.mirror_url})
+            try std.fmt.allocPrint(arena, "{s}/catalog.json", .{root})
         else
             try std.fmt.allocPrint(arena, "{s}{s}", .{ self.cfg.store_url, CATALOG_PATH });
 
@@ -687,7 +696,7 @@ pub const Manager = struct {
             // 不能因为它缺文件/没启动就把同步搞挂（这是最容易上新功能时踩的坑）。
             var active_url = catalog_url;
             var response = client.getBytes(active_url, &.{}, MAX_CATALOG_BYTES) catch |mirror_err| blk: {
-                if (self.cfg.mirror_url.len == 0) {
+                if (mirror == null) {
                     self.setError("拉取组件目录失败：{s}；URL={s}（{s}）", .{ @errorName(mirror_err), active_url, fetchHint(mirror_err) });
                     return false;
                 }
@@ -698,9 +707,9 @@ pub const Manager = struct {
                     return false;
                 };
             };
-            if (!response.isSuccess() and self.cfg.mirror_url.len > 0 and !std.mem.eql(u8, active_url, catalog_url)) {
+            if (!response.isSuccess() and mirror != null and !std.mem.eql(u8, active_url, catalog_url)) {
                 // 平台也失败：保持原状（下面统一报错）
-            } else if (!response.isSuccess() and self.cfg.mirror_url.len > 0) {
+            } else if (!response.isSuccess() and mirror != null) {
                 response.deinit(self.gpa);
                 active_url = try std.fmt.allocPrint(arena, "{s}{s}", .{ self.cfg.store_url, CATALOG_PATH });
                 std.debug.print("[pek-zip] 镜像目录 HTTP {d}，回退平台 {s}\n", .{ response.status, active_url });
@@ -803,7 +812,6 @@ pub const Manager = struct {
 
     /// 目录验签公钥来源。
     pub const VerifyKeySource = enum { configured, tofu, none };
-
     /// 目录验签用的公钥：配置的 `PubKey` 优先；留空时用注册时 TOFU 学到的平台公钥。
     ///
     /// 为什么必须有 TOFU 分支：配置注释写着「留空 = 注册时学习公钥并落盘固定，不需要每个应用都配」，
@@ -830,6 +838,49 @@ pub const Manager = struct {
             .tofu => "TOFU 学到的平台公钥",
             .none => "无公钥（不验签）",
         };
+    }
+
+    /// 镜像根：配置优先；留空则**自动探测本机 RAgent**（`MirrorProbeUrl`，默认 5501/ipdb）。
+    ///
+    /// 探测只做一次（成功/失败都记住），超时 800ms：探不到就当没有，直接直连平台，
+    /// 不能因为“你可能装了代理”就拖慢启动或同步。
+    fn resolveMirror(self: *Manager, client: *http_mod.Client) ?[]const u8 {
+        if (self.cfg.mirror_url.len > 0) return self.cfg.mirror_url;
+        if (self.cfg.mirror_probe_url.len == 0) return null;
+        if (self.mirror_probed) return if (self.mirror_detected) |m| m else null;
+        self.mirror_probed = true;
+
+        const probe_url = std.fmt.allocPrint(self.gpa, "{s}/catalog.json", .{self.cfg.mirror_probe_url}) catch return null;
+        defer self.gpa.free(probe_url);
+        const saved_timeout = client.timeout_ms;
+        client.timeout_ms = MIRROR_PROBE_TIMEOUT_MS;
+        defer client.timeout_ms = saved_timeout;
+
+        if (client.getBytes(probe_url, &.{}, MAX_CATALOG_BYTES)) |response_const| {
+            var response = response_const;
+            defer response.deinit(self.gpa);
+            if (response.isSuccess()) {
+                self.mirror_detected = self.gpa.dupe(u8, self.cfg.mirror_probe_url) catch null;
+                if (self.mirror_detected != null) {
+                    std.debug.print("[pek-zip] 已自动发现本机镜像：{s}（探测 {s} 返回 HTTP {d}）\n", .{
+                        self.cfg.mirror_probe_url, probe_url, response.status,
+                    });
+                }
+            }
+        } else |_| {
+            // 探不到（没有代理/未启用/端口改过）属正常待：静默直连平台，不吐日志避免刷屏
+        }
+        return if (self.mirror_detected) |m| m else null;
+    }
+
+    /// 已自动探测到的镜像根（未配置 `MirrorUrl` 时用于 `zpk status` 展示）。
+    pub fn detectedMirror(self: *Manager) ?[]const u8 {
+        return if (self.mirror_detected) |m| m else null;
+    }
+
+    /// 是否已经做过一次自动探测（没做过说明本次进程还没走到联网路径）。
+    pub fn mirrorProbeDone(self: *Manager) bool {
+        return self.mirror_probed;
     }
 
     /// 懒加载授权客户端（身份文件在 `StateDir`，首次创建后持久化）。
@@ -876,8 +927,8 @@ pub const Manager = struct {
     ) ![]const u8 {
         // 镜像模式：目录里的 url 是平台绝对地址，把 origin 换成镜像（只取文件名），
         // 且不走票据（镜像是本机/内网可信源，没有平台授权关系）。
-        if (self.cfg.mirror_url.len > 0) {
-            return mirrorComponentUrl(arena, self.cfg.mirror_url, entry.url);
+        if (self.resolveMirror(client)) |root| {
+            return mirrorComponentUrl(arena, root, entry.url);
         }
         return self.platformDownloadUrl(arena, client, entry, buf);
     }
@@ -915,7 +966,7 @@ pub const Manager = struct {
     ) !void {
         var url_buf: [2048]u8 = undefined;
         var url = try self.downloadUrl(arena, client, entry, &url_buf);
-        const mirror_on = self.cfg.mirror_url.len > 0;
+        const mirror_on = self.resolveMirror(client) != null;
         const stamp = std.Io.Clock.real.now(self.io).nanoseconds;
         const temp_path = try std.fmt.allocPrint(arena, "{s}/.download-{s}-{s}-{d}.zip", .{
             self.cfg.cache_dir, entry.id, entry.version, @as(u64, @intCast(@mod(stamp, 1_000_000_000))),

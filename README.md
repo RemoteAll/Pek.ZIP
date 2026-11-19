@@ -79,6 +79,21 @@ HttpTimeoutMs = 120000            # 单次请求总超时（毫秒；0 = 不限�
   其余进程直接复用；崩溃残留超 10 分钟自动视为陈旧。
 - **定时更新**：由任一个常驻进程（或计划任务）定时跑 `zpk sync` 即可，其余应用启动只读共享缓存。
 
+### 与 zzig 的关系（复用生态，不重复造）
+
+本项目只依赖 Zig 标准库，但会**对齐并复用自研生态 zzig 的既定口径**（而不是另搞一套）：
+
+| zzig 能力 | 本项目 |
+|---|---|
+| `http.fetchBytesWithTimeout`（`io.concurrent` + `Future.cancel`） | ✅ 已复用该机制实现请求总超时 |
+| `fsio.writeFileAtomic` / `replaceFile`（`.tmp` + 替换） | ✅ `src/fsutil.zig` 同口径，用于客户端身份、`Config/Ip.toml` |
+| `net/socket_timeout.setRecvTimeout` | ⏭ 不适用：socket 由 `std.http.Client` 内部持有 |
+| `crypto/hash_util.sha256Hex` | ⏭ 我们要的是**流式**算文件 SHA-256，`std.crypto` 已够 |
+| `archive/zip.Reader` | ⏭ `std.zip.extract` 已拒绝绝对路径与 `..` |
+
+不直接 `b.dependency("zzig")`：zzig 的 `build.zig.zon` 依赖本地路径 `../lighting`，
+作为独立仓库的 Pek.ZIP 绑这个路径会在别的机器上直接跑不起来。
+
 ### 性能与调优（实测，ReleaseFast，20 万次/项）
 
 | 场景 | ns/op | 备注 |

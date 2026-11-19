@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const http_mod = @import("http.zig");
+const fsutil = @import("fsutil.zig");
 
 const Ed25519 = std.crypto.sign.Ed25519;
 
@@ -115,7 +116,7 @@ pub const AuthClient = struct {
             std.Io.random(io, &raw);
             var hex_buf: [32]u8 = undefined;
             _ = hexEncode(&raw, &hex_buf);
-            writeFile(io, install_path, &hex_buf) catch return Error.IoFailed;
+            fsutil.writeFileAtomic(io, gpa, install_path, &hex_buf) catch return Error.IoFailed;
             self.setInstallId(&hex_buf) catch return Error.InvalidIdentity;
         }
 
@@ -130,7 +131,7 @@ pub const AuthClient = struct {
             std.Io.random(io, &seed);
             var hex_buf: [64]u8 = undefined;
             _ = hexEncode(&seed, &hex_buf);
-            writeFile(io, key_path, &hex_buf) catch return Error.IoFailed;
+            fsutil.writeFileAtomic(io, gpa, key_path, &hex_buf) catch return Error.IoFailed;
             self.setSeed(&hex_buf) catch return Error.InvalidIdentity;
         }
 
@@ -230,7 +231,8 @@ pub const AuthClient = struct {
             self.setPlatformPubkey(&platform_key);
             const path = std.fs.path.join(self.gpa, &.{ self.state_dir, "pubkey.txt" }) catch return Error.OutOfMemory;
             defer self.gpa.free(path);
-            writeFile(self.io, path, &self.platform_pubkey_hex) catch {};
+            // TOFU 公钥必须原子落盘：截断会导致下次启动把它当成非法身份
+            fsutil.writeFileAtomic(self.io, self.gpa, path, &self.platform_pubkey_hex) catch {};
         }
 
         // License + 签名校验

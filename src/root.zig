@@ -24,6 +24,7 @@ pub const catalog = @import("catalog.zig");
 pub const store = @import("store.zig");
 pub const http = @import("http.zig");
 pub const auth = @import("auth.zig");
+pub const fsutil = @import("fsutil.zig");
 pub const manager = @import("manager.zig");
 
 pub const IpAddr = ip.IpAddr;

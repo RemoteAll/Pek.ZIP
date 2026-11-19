@@ -23,6 +23,7 @@
 //! 相对路径一律按 `base` 解析。
 
 const std = @import("std");
+const fsutil = @import("fsutil.zig");
 
 /// 默认 RPanelServer 平台地址（固定；一般无需修改）。
 pub const DEFAULT_STORE_URL = "https://p.sc8.fun";
@@ -230,7 +231,6 @@ fn parseBool(value: []const u8) ?bool {
 
 /// 读配置文件；不存在时写模板再读。
 fn readOrCreate(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
-    const dir = std.Io.Dir.cwd();
     if (std.Io.Dir.cwd().openFile(io, path, .{})) |file| {
         defer file.close(io);
         const stat = try file.stat(io);
@@ -243,7 +243,8 @@ fn readOrCreate(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
         else => return err,
     }
 
-    try dir.writeFile(io, .{ .sub_path = path, .data = TEMPLATE });
+    // 首次运行：写模板（原子写，避免断电留下半截配置）
+    try fsutil.writeFileAtomic(io, gpa, path, TEMPLATE);
     return gpa.dupe(u8, TEMPLATE);
 }
 

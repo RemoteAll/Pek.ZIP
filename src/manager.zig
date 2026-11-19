@@ -730,27 +730,32 @@ pub const Manager = struct {
             // 配置的 PubKey 优先；留空时用注册时 TOFU 学到的平台公钥（否则留空＝完全不验签，TOFU 形同虚设）
             var sig_text: ?[]const u8 = null;
             if (self.catalogVerifyKey()) |verify_key| {
-                const sig_url = try std.fmt.allocPrint(arena, "{s}.sig", .{active_url});
-                var sig_response = client.getBytes(sig_url, &.{}, MAX_SIGNATURE_BYTES) catch |err| {
-                    self.setError("拉取组件目录签名失败：{s}；URL={s}（{s}）", .{ @errorName(err), sig_url, fetchHint(err) });
-                    return false;
+                var reason: []const u8 = "";
+                sig_text = self.verifyCatalogSig(arena, &client, active_url, response.body, verify_key, &reason) catch |sig_err| blk: {
+                    const platform_url = try std.fmt.allocPrint(arena, "{s}{s}", .{ self.cfg.store_url, CATALOG_PATH });
+                    const on_mirror = mirror != null and !std.mem.eql(u8, active_url, platform_url);
+                    if (!on_mirror) {
+                        self.setError("组件目录签名校验失败：{s}（{s}；URL={s}）", .{ @errorName(sig_err), reason, active_url });
+                        return false;
+                    }
+                    // 镜像没转发 `.sig`（或签名对不上）→ 整个目录改从平台重取：
+                    // 镜像只是省带宽的优化，不能把「有 Key 的客户端」直接卡死。
+                    std.debug.print("[pek-zip] 镜像目录签名不可用：{s}（{s}），回退平台重取 {s}\n", .{ @errorName(sig_err), reason, platform_url });
+                    response.deinit(self.gpa);
+                    active_url = platform_url;
+                    response = client.getBytes(active_url, &.{}, MAX_CATALOG_BYTES) catch |err| {
+                        self.setError("拉取组件目录失败：{s}；URL={s}（镜像签名不可用：{s}）", .{ @errorName(err), active_url, reason });
+                        return false;
+                    };
+                    if (!response.isSuccess()) {
+                        self.setError("拉取组件目录失败：HTTP {d}，URL={s}（镜像签名不可用：{s}）", .{ response.status, active_url, reason });
+                        return false;
+                    }
+                    break :blk self.verifyCatalogSig(arena, &client, active_url, response.body, verify_key, &reason) catch |err2| {
+                        self.setError("组件目录签名校验失败：{s}（{s}；URL={s}，镜像回退后仍失败）", .{ @errorName(err2), reason, active_url });
+                        return false;
+                    };
                 };
-                defer sig_response.deinit(self.gpa);
-                if (!sig_response.isSuccess()) {
-                    self.setError("拉取组件目录签名失败：HTTP {d}，URL={s}", .{ sig_response.status, sig_url });
-                    return false;
-                }
-                sig_text = std.mem.trim(u8, sig_response.body, " \t\r\n");
-                auth_mod.verifyBase64(verify_key, response.body, sig_text.?) catch |err| {
-                    self.setError("组件目录签名校验失败：{s}（公钥来源 {s}，目录可能被篡改；URL={s}）", .{
-                        @errorName(err), self.verifyKeySourceText(), active_url,
-                    });
-                    return false;
-                };
-                // 必须拷进 arena：`sig_response` 的 defer 在本 if 块结束就释放了，
-                // 直接留着 `sig_text` 会变成悬垂指针（实测把 'UUUU…' 写进了缓存，
-                // 导致下次启动缓存验签必失败、TTL 形同失效、每次都要重拉 85 KB 目录）。
-                sig_text = try arena.dupe(u8, sig_text.?);
             } else {
                 std.debug.print("[pek-zip] 尚无可信公钥（未配 PubKey 且还没注册过），本次目录不验签；注册成功后自动强制验签\n", .{});
             }
@@ -838,6 +843,43 @@ pub const Manager = struct {
             .tofu => "TOFU 学到的平台公钥",
             .none => "无公钥（不验签）",
         };
+    }
+
+    /// 取 `{base_url}.sig` 并验签；成功返回**已 trim 且拷进 arena** 的签名文本。
+    ///
+    /// 失败时把可读原因写进 `reason`（上层拼日志用）并返回 error。
+    /// 注：返回值必须拷进 arena——签名响应体在函数返回时就释放，直接外传会成悬垂指针
+    ///（本项目实测过：把 'UUUU…' 写进缓存，导致下次启动缓存验签必失败、TTL 形同虚设）。
+    fn verifyCatalogSig(
+        self: *Manager,
+        arena: std.mem.Allocator,
+        client: *http_mod.Client,
+        base_url: []const u8,
+        body: []const u8,
+        verify_key: []const u8,
+        reason: *[]const u8,
+    ) ![]const u8 {
+        const sig_url = std.fmt.allocPrint(arena, "{s}.sig", .{base_url}) catch {
+            reason.* = "分配签名 URL 失败";
+            return error.OutOfMemory;
+        };
+        var sig_response = client.getBytes(sig_url, &.{}, MAX_SIGNATURE_BYTES) catch |err| {
+            reason.* = std.fmt.allocPrint(arena, "拉取签名失败 {s}：{s}（{s}）", .{ @errorName(err), sig_url, fetchHint(err) }) catch "拉取签名失败";
+            return err;
+        };
+        defer sig_response.deinit(self.gpa);
+        if (!sig_response.isSuccess()) {
+            reason.* = std.fmt.allocPrint(arena, "签名 HTTP {d}（{s}）", .{ sig_response.status, sig_url }) catch "签名缺失";
+            return error.HttpStatus;
+        }
+        const trimmed = std.mem.trim(u8, sig_response.body, " \t\r\n");
+        auth_mod.verifyBase64(verify_key, body, trimmed) catch |err| {
+            reason.* = std.fmt.allocPrint(arena, "验签失败 {s}（公钥来源 {s}）", .{ @errorName(err), self.verifyKeySourceText() }) catch "验签失败";
+            return err;
+        };
+        const dup = arena.dupe(u8, trimmed) catch return error.OutOfMemory;
+        reason.* = "";
+        return dup;
     }
 
     /// 镜像根：配置优先；留空则**自动探测本机 RAgent**（`MirrorProbeUrl`，默认 5501/ipdb）。

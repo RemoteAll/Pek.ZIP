@@ -11,7 +11,7 @@
 
 param(
     [string]$PekIpData = 'G:\Code\Rust\Pek.IP\data',
-    [int]$MinTests = 60
+    [int]$MinTests = 61
 )
 
 $ErrorActionPreference = 'Stop'

@@ -202,6 +202,16 @@ pub const Locator = struct {
         return self.lookup(scratch, try IpAddr.parse(text));
     }
 
+    /// 查询 IPv4（数值语义与 Rust `IpLocator::lookup_ipv4` 一致：`1.2.3.4 → 0x01020304`）。
+    pub fn lookupIpv4(self: *const Locator, scratch: *Scratch, ip: u32) !Location {
+        return self.lookup(scratch, .{ .v4 = ip });
+    }
+
+    /// 查询 IPv6（大端 u128，与 `Ipv6Addr::octets()` 逐字节一致）。
+    pub fn lookupIpv6(self: *const Locator, scratch: *Scratch, ip: u128) !Location {
+        return self.lookup(scratch, .{ .v6 = ip });
+    }
+
     fn lookupXdb(self: *const Locator, ip: IpAddr) !?[]const u8 {
         const readers: [2]*const ?xdb_mod.XdbReader = switch (ip) {
             .v4 => .{ &self.xdb_v4, &self.xdb_v6 },
@@ -505,6 +515,20 @@ test "展示文本" {
     var empty_buf: [32]u8 = undefined;
     const unknown = Location{ .ip = try IpAddr.parse("1.1.1.1") };
     try testing.expectEqualStrings("未知", unknown.displayShort(&empty_buf));
+}
+
+test "lookupIpv4 / lookupIpv6 数值入口与文本入口结果一致" {
+    var scratch: Scratch = .{};
+    const locator = Locator{};
+
+    const by_number = try locator.lookupIpv4(&scratch, 0x0A00_0001); // 10.0.0.1
+    const by_text = try locator.lookupStr(&scratch, "10.0.0.1");
+    try testing.expect(by_number.is_private);
+    try testing.expectEqual(by_text.ip_class.?, by_number.ip_class.?);
+    try testing.expectEqual(by_text.source, by_number.source);
+
+    const loop6 = try locator.lookupIpv6(&scratch, 1); // ::1
+    try testing.expectEqual(IpClass.loopback, loop6.ip_class.?);
 }
 
 test "真实数据端到端（xdb + MMDB）" {

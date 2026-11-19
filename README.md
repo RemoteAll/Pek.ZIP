@@ -48,7 +48,8 @@ locator.world_asn = try pek.MmdbReader.open(io, gpa, "data/dbip-asn-lite.mmdb", 
 ```text
 zpk lookup 114.114.114.114 8.8.8.8   # 查询（默认只读本地，不因网络卡住）
 zpk lookup 114.114.114.114 --online  # 后台补缺并等下载结束再退出
-zpk sync                             # 阻塞式补齐数据
+zpk sync                             # 检查更新：本地齐全也比对目录版本，有新版本才下
+zpk sync --force                     # 忽略 CatalogMaxAge 目录缓存，强制联网刷新
 zpk selfcheck                        # 配置 + 数据集状态 + 样例查询
 zpk mkxdb out.xdb                    # 生成最小 xdb（测试/演示）
 ```
@@ -63,8 +64,18 @@ CacheDir   = "Data/IpCache"       # 下载缓存（{id}/{version}/ + .pek-zip.js
 StateDir   = "Data/IpClient"      # 客户端身份（授权流程预留）
 AutoEnroll = true                 # 预留
 DownloadV6 = false                # IPv6 xdb 约 37 MiB，默认不下载
+CatalogMaxAge = 3600              # 组件目录缓存新鲜期（秒）；期间只读本地，0 = 每次都拉
 # CaFile   = "Config/ca.pem"      # 内网/自签平台的自定义根证书
 ```
+
+### 带宽与更新策略
+
+- **目录不重复拉**：`catalog.json` 落到 `{CacheDir}/.catalog.json`，`CatalogMaxAge` 内直接用本地缓存
+  （配了 `PubKey` 时连缓存一起验签；时钟回拨/缓存损坏一律按不新鲜处理）。
+- **包只在新版本时下**：`zpk sync` 比对目录版本与本地已装版本，同版本/更低一律跳过。
+- **同机只下一次**：共享 `CacheDir` 时由 `{CacheDir}/.sync.lock` 独占创建保证一个进程去下载，
+  其余进程直接复用；崩溃残留超 10 分钟自动视为陈旧。
+- **定时更新**：由任一个常驻进程（或计划任务）定时跑 `zpk sync` 即可，其余应用启动只读共享缓存。
 
 数据文件命名（不区分大小写，与 Pek.IP 一致）：
 

@@ -30,6 +30,7 @@ pub fn main(init: std.process.Init) !void {
 fn run(io: std.Io, gpa: std.mem.Allocator, argv: []const [:0]const u8) !u8 {
     var base: []const u8 = ".";
     var online = false;
+    var force_refresh = false;
     var positional: [64][]const u8 = undefined;
     var positional_count: usize = 0;
 
@@ -48,6 +49,10 @@ fn run(io: std.Io, gpa: std.mem.Allocator, argv: []const [:0]const u8) !u8 {
         }
         if (std.mem.eql(u8, arg, "--online")) {
             online = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--force")) {
+            force_refresh = true;
             continue;
         }
         if (std.mem.startsWith(u8, arg, "-")) return usage(io, "未知参数");
@@ -172,7 +177,13 @@ fn run(io: std.Io, gpa: std.mem.Allocator, argv: []const [:0]const u8) !u8 {
     }
 
     if (std.mem.eql(u8, command, "sync")) {
-        const manager = try pek.Manager.start(io, gpa, base, .{ .background = false, .allow_partial = true });
+        // 检查更新：本地齐全也会比对目录版本；目录本身受 CatalogMaxAge 约束（--force 强制联网）
+        const manager = try pek.Manager.start(io, gpa, base, .{
+            .background = false,
+            .allow_partial = true,
+            .check_updates = true,
+            .force_refresh = force_refresh,
+        });
         defer manager.destroy();
         try manager.ensureNow();
         try printStatus(io, manager);
@@ -225,12 +236,13 @@ fn run(io: std.Io, gpa: std.mem.Allocator, argv: []const [:0]const u8) !u8 {
 fn printStatus(io: std.Io, manager: *pek.Manager) !void {
     var line: [1024]u8 = undefined;
     const cfg = manager.cfg;
-    try stdout(io, try std.fmt.bufPrint(&line, "StoreUrl : {s}\nDataDir  : {s}\nCacheDir : {s}\nPubKey   : {s}\nDownloadV6: {}\n", .{
+    try stdout(io, try std.fmt.bufPrint(&line, "StoreUrl : {s}\nDataDir  : {s}\nCacheDir : {s}\nPubKey   : {s}\n下载IPv6 : {}\n目录TTL  : {d}s（0 = 每次都拉）\n", .{
         cfg.store_url,
         cfg.data_dir,
         cfg.cache_dir,
         if (cfg.pubkey.len == 0) "(未配置：不校验目录签名)" else cfg.pubkey,
         cfg.download_v6,
+        cfg.catalog_max_age,
     }));
 
     for ([_]pek.Dataset{ .ip2region_v4, .ip2region_v6, .world, .asn }) |dataset| {
@@ -253,7 +265,7 @@ fn usage(io: std.Io, reason: []const u8) !u8 {
         \\用法：
         \\  zpk lookup <ip>... [--online] [--base <目录>]
         \\  zpk enroll [--base <目录>]
-        \\  zpk sync [--base <目录>]
+        \\  zpk sync [--force] [--base <目录>]   检查更新（--force 忽略目录 TTL 强制联网）
         \\  zpk online <ip>...             在线 API 兜底查询（ip-api.com）
         \\  zpk csv2db <输入.csv> <输出.dat>   DB-IP CSV → 纯真格式
         \\  zpk selfcheck [--base <目录>]

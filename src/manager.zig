@@ -48,6 +48,73 @@ pub const DATASET_GEOLITE2_ASN = "geolite2-asn";
 
 const CATALOG_PATH = "/components/catalog.json";
 const MAX_CATALOG_BYTES: usize = 1024 * 1024;
+/// 本地目录缓存：与 `CatalogMaxAge` 配合，避免每次启动/每次 sync 都联网拉目录。
+/// `.catalog.meta` 只有一行 unix 秒（抓取时间）。
+const CATALOG_CACHE_JSON = ".catalog.json";
+const CATALOG_CACHE_SIG = ".catalog.sig";
+const CATALOG_CACHE_META = ".catalog.meta";
+
+/// 读一个小文本文件（超限或不存在返回 null）。
+fn readSmallFile(io: std.Io, arena: std.mem.Allocator, path: []const u8, limit: usize) ?[]u8 {
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
+    defer file.close(io);
+    var buf: [4096]u8 = undefined;
+    var reader = file.reader(io, &buf);
+    return reader.interface.allocRemaining(arena, .limited(limit)) catch null;
+}
+
+/// 本地目录缓存是否仍在新鲜期内。
+/// `max_age_s == 0` 表示「每次都拉」；缓存缺失/损坏/时钟回拨一律视为不新鲜。
+fn catalogCacheFresh(io: std.Io, arena: std.mem.Allocator, cache_dir: []const u8, max_age_s: u32) bool {
+    if (max_age_s == 0) return false;
+
+    const json_path = std.fs.path.join(arena, &.{ cache_dir, CATALOG_CACHE_JSON }) catch return false;
+    const json_file = std.Io.Dir.cwd().openFile(io, json_path, .{}) catch return false;
+    json_file.close(io);
+
+    const meta_path = std.fs.path.join(arena, &.{ cache_dir, CATALOG_CACHE_META }) catch return false;
+    const meta_file = std.Io.Dir.cwd().openFile(io, meta_path, .{}) catch return false;
+    defer meta_file.close(io);
+    var buf: [64]u8 = undefined;
+    var reader = meta_file.reader(io, &buf);
+    const line_opt = reader.interface.takeDelimiter('\n') catch null;
+    const line = line_opt orelse return false;
+    const fetched_at = std.fmt.parseInt(u64, std.mem.trim(u8, line, " \t\r"), 10) catch return false;
+
+    const now_ns = std.Io.Clock.real.now(io).nanoseconds;
+    const now_s: u64 = @intCast(@divTrunc(now_ns, std.time.ns_per_s));
+    if (now_s < fetched_at) return false; // 时钟回拨：当作不新鲜，重拉一次
+    return now_s - fetched_at <= max_age_s;
+}
+
+/// 写本地目录缓存。缓存是「省带宽」的优化，失败只告警不影响正确性。
+fn writeCatalogCache(io: std.Io, arena: std.mem.Allocator, cache_dir: []const u8, body: []const u8, sig: ?[]const u8) void {
+    std.Io.Dir.cwd().createDirPath(io, cache_dir) catch |err| {
+        std.debug.print("[pek-zip] 组件目录缓存目录创建失败：{s}（{s}）\n", .{ cache_dir, @errorName(err) });
+        return;
+    };
+
+    const json_path = std.fs.path.join(arena, &.{ cache_dir, CATALOG_CACHE_JSON }) catch return;
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = json_path, .data = body }) catch |err| {
+        std.debug.print("[pek-zip] 组件目录缓存写入失败：{s}（{s}）；本次仍用内存中的目录\n", .{ json_path, @errorName(err) });
+        return;
+    };
+
+    if (sig) |text| {
+        const sig_path = std.fs.path.join(arena, &.{ cache_dir, CATALOG_CACHE_SIG }) catch return;
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sig_path, .data = text }) catch |err| {
+            std.debug.print("[pek-zip] 组件目录签名缓存写入失败：{s}（{s}）\n", .{ sig_path, @errorName(err) });
+        };
+    }
+
+    var stamp_buf: [32]u8 = undefined;
+    const now_s: u64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+    const stamp = std.fmt.bufPrint(&stamp_buf, "{d}\n", .{now_s}) catch return;
+    const meta_path = std.fs.path.join(arena, &.{ cache_dir, CATALOG_CACHE_META }) catch return;
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = meta_path, .data = stamp }) catch |err| {
+        std.debug.print("[pek-zip] 组件目录时间戳写入失败：{s}（{s}）\n", .{ meta_path, @errorName(err) });
+    };
+}
 const MAX_SIGNATURE_BYTES: usize = 8 * 1024;
 const DEFAULT_PACKAGE_LIMIT: usize = 512 * 1024 * 1024;
 
@@ -101,6 +168,10 @@ pub const StartOptions = struct {
     allow_partial: bool = true,
     /// 是否下载 IPv6 xdb（覆盖配置项，用于测试）。
     download_v6: ?bool = null,
+    /// 即使本地数据齐全也比对组件目录版本，有新版本才下载（`zpk sync` 用）。
+    check_updates: bool = false,
+    /// 忽略 `CatalogMaxAge` 缓存新鲜期，强制联网拉目录（`zpk sync --force`）。
+    force_refresh: bool = false,
 };
 
 /// 极短临界区自旋锁（只保护「退休/销毁」路径，查询热路径不进锁）。
@@ -426,6 +497,46 @@ pub const Manager = struct {
         return "";
     }
 
+    /// 该数据集是否已有本地可用数据（缓存安装目录 或 用户数据目录）。
+    fn hasLocal(self: *Manager, arena: std.mem.Allocator, dataset: Dataset) !bool {
+        if (try self.store.findLocalLatest(arena, dataset.id()) != null) return true;
+        const kind: Kind = switch (dataset) {
+            .ip2region_v4 => .xdb_v4,
+            .ip2region_v6 => .xdb_v6,
+            .world => .world,
+            .asn => .asn,
+        };
+        return (try localPath(self.io, arena, kind, self.cfg.data_dir)) != null;
+    }
+
+    /// 读本地组件目录缓存（新鲜期内 + 签名复校）。
+    /// 返回 `null` = 需要联网刷新（缓存缺失/过期/签名不可信）。
+    fn loadCachedCatalog(self: *Manager, arena: std.mem.Allocator) !?[]const u8 {
+        if (self.opts.force_refresh) return null;
+        if (!catalogCacheFresh(self.io, arena, self.cfg.cache_dir, self.cfg.catalog_max_age)) return null;
+
+        const json_path = try std.fs.path.join(arena, &.{ self.cfg.cache_dir, CATALOG_CACHE_JSON });
+        const body = readSmallFile(self.io, arena, json_path, MAX_CATALOG_BYTES) orelse return null;
+
+        // 配了 PubKey 就必须连缓存一起验签：否则改缓存文件即可绕过验签
+        if (self.cfg.pubkey.len > 0) {
+            const sig_path = try std.fs.path.join(arena, &.{ self.cfg.cache_dir, CATALOG_CACHE_SIG });
+            const sig_text = readSmallFile(self.io, arena, sig_path, MAX_SIGNATURE_BYTES) orelse {
+                std.debug.print("[pek-zip] 本地目录缓存缺签名（{s}），改走联网刷新\n", .{sig_path});
+                return null;
+            };
+            auth_mod.verifyBase64(self.cfg.pubkey, body, std.mem.trim(u8, sig_text, " \t\r\n")) catch |err| {
+                std.debug.print("[pek-zip] 本地目录缓存签名校验失败：{s}，改走联网刷新\n", .{@errorName(err)});
+                return null;
+            };
+        }
+
+        std.debug.print("[pek-zip] 复用本地组件目录缓存（{s}/{s}，新鲜期 {d}s）\n", .{
+            self.cfg.cache_dir, CATALOG_CACHE_JSON, self.cfg.catalog_max_age,
+        });
+        return body;
+    }
+
     /// 确保 4 个数据集（按配置）都在本地可用：缓存优先，缺失才联网。
     fn ensureAll(self: *Manager) !void {
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
@@ -435,22 +546,23 @@ pub const Manager = struct {
         const download_v6 = self.opts.download_v6 orelse self.cfg.download_v6;
         var needed: [4]Dataset = undefined;
         var needed_count: usize = 0;
+        var missing_count: usize = 0;
         for ([_]Dataset{ .ip2region_v4, .ip2region_v6, .world, .asn }) |dataset| {
             if (dataset == .ip2region_v6 and !download_v6) continue;
-            if (try self.store.findLocalLatest(arena, dataset.id()) != null) continue;
-            if (try localPath(self.io, arena, switch (dataset) {
-                .ip2region_v4 => .xdb_v4,
-                .ip2region_v6 => .xdb_v6,
-                .world => .world,
-                .asn => .asn,
-            }, self.cfg.data_dir) != null) continue;
-            needed[needed_count] = dataset;
-            needed_count += 1;
+            const has_local = try self.hasLocal(arena, dataset);
+            if (!has_local) missing_count += 1;
+            // 缺数据必须去拿；本地齐全时只有「检查更新」才需要目录
+            if (!has_local or self.opts.check_updates) {
+                needed[needed_count] = dataset;
+                needed_count += 1;
+            }
         }
         if (needed_count == 0) return;
 
         if (self.cfg.store_url.len == 0) {
-            self.setError("缺少 {d} 个数据集但未配置 StoreUrl（仅本地缓存模式；把数据放进 {s} 即可）", .{ needed_count, self.cfg.data_dir });
+            // 纯检查更新 + 离线模式：本地齐全就不必报错
+            if (missing_count == 0) return;
+            self.setError("缺少 {d} 个数据集但未配置 StoreUrl（仅本地缓存模式；把数据放进 {s} 即可）", .{ missing_count, self.cfg.data_dir });
             return;
         }
 
@@ -465,38 +577,49 @@ pub const Manager = struct {
         defer client.deinit();
 
         const catalog_url = try std.fmt.allocPrint(arena, "{s}{s}", .{ self.cfg.store_url, CATALOG_PATH });
-        var response = client.getBytes(catalog_url, &.{}, MAX_CATALOG_BYTES) catch |err| {
-            self.setError("拉取组件目录失败：{s}；URL={s}（确认平台地址/网络/证书）", .{ @errorName(err), catalog_url });
-            return;
-        };
-        defer response.deinit(self.gpa);
-        if (!response.isSuccess()) {
-            self.setError("拉取组件目录失败：HTTP {d}，URL={s}，响应片段：{s}", .{
-                response.status, catalog_url, response.snippet(200),
-            });
-            return;
-        }
 
-        // 配了 PubKey 就强制验签（目录被篡改宁可不可用）
-        if (self.cfg.pubkey.len > 0) {
-            const sig_url = try std.fmt.allocPrint(arena, "{s}.sig", .{catalog_url});
-            var sig_response = client.getBytes(sig_url, &.{}, MAX_SIGNATURE_BYTES) catch |err| {
-                self.setError("拉取组件目录签名失败：{s}；URL={s}（检查证书/网络）", .{ @errorName(err), sig_url });
+        // 目录本身有 TTL（`CatalogMaxAge`）：新鲜期内直接用本地缓存，不联网。
+        var catalog_body: []const u8 = undefined;
+        if (try self.loadCachedCatalog(arena)) |cached| {
+            catalog_body = cached;
+        } else {
+            var response = client.getBytes(catalog_url, &.{}, MAX_CATALOG_BYTES) catch |err| {
+                self.setError("拉取组件目录失败：{s}；URL={s}（确认平台地址/网络/证书）", .{ @errorName(err), catalog_url });
                 return;
             };
-            defer sig_response.deinit(self.gpa);
-            if (!sig_response.isSuccess()) {
-                self.setError("拉取组件目录签名失败：HTTP {d}，URL={s}", .{ sig_response.status, sig_url });
+            defer response.deinit(self.gpa);
+            if (!response.isSuccess()) {
+                self.setError("拉取组件目录失败：HTTP {d}，URL={s}，响应片段：{s}", .{
+                    response.status, catalog_url, response.snippet(200),
+                });
                 return;
             }
-            const sig_text = std.mem.trim(u8, sig_response.body, " \t\r\n");
-            auth_mod.verifyBase64(self.cfg.pubkey, response.body, sig_text) catch |err| {
-                self.setError("组件目录签名校验失败：{s}（PubKey 或目录可能被篡改；URL={s}）", .{ @errorName(err), catalog_url });
-                return;
-            };
+
+            // 配了 PubKey 就强制验签（目录被篡改宁可不可用）
+            var sig_text: ?[]const u8 = null;
+            if (self.cfg.pubkey.len > 0) {
+                const sig_url = try std.fmt.allocPrint(arena, "{s}.sig", .{catalog_url});
+                var sig_response = client.getBytes(sig_url, &.{}, MAX_SIGNATURE_BYTES) catch |err| {
+                    self.setError("拉取组件目录签名失败：{s}；URL={s}（检查证书/网络）", .{ @errorName(err), sig_url });
+                    return;
+                };
+                defer sig_response.deinit(self.gpa);
+                if (!sig_response.isSuccess()) {
+                    self.setError("拉取组件目录签名失败：HTTP {d}，URL={s}", .{ sig_response.status, sig_url });
+                    return;
+                }
+                sig_text = std.mem.trim(u8, sig_response.body, " \t\r\n");
+                auth_mod.verifyBase64(self.cfg.pubkey, response.body, sig_text.?) catch |err| {
+                    self.setError("组件目录签名校验失败：{s}（PubKey 或目录可能被篡改；URL={s}）", .{ @errorName(err), catalog_url });
+                    return;
+                };
+            }
+            writeCatalogCache(self.io, arena, self.cfg.cache_dir, response.body, sig_text);
+            // response 马上 deinit，正文必须拷进 arena
+            catalog_body = try arena.dupe(u8, response.body);
         }
 
-        var catalog = catalog_mod.parse(self.gpa, response.body) catch |err| {
+        var catalog = catalog_mod.parse(self.gpa, catalog_body) catch |err| {
             self.setError("解析组件目录失败：{s}（URL={s}）", .{ @errorName(err), catalog_url });
             return;
         };
@@ -510,6 +633,22 @@ pub const Manager = struct {
                 });
                 continue;
             };
+            if (self.opts.check_updates) {
+                // 只在远端版本更高时才下载（同版本/更低一律跳过，省带宽）
+                const latest = self.store.findLocalLatest(arena, dataset.id()) catch |err| blk: {
+                    std.debug.print("[pek-zip] 读取 {s} 本地版本失败：{s}（按需重新下载）\n", .{ dataset.id(), @errorName(err) });
+                    break :blk null;
+                };
+                if (latest) |installed| {
+                    if (catalog_mod.compareVersions(entry.version, installed.version) != .gt) {
+                        std.debug.print("[pek-zip] {s} 已是最新（本地 {s}，目录 {s}）\n", .{
+                            dataset.id(), installed.version, entry.version,
+                        });
+                        continue;
+                    }
+                    std.debug.print("[pek-zip] {s} 发现新版本：{s} → {s}\n", .{ dataset.id(), installed.version, entry.version });
+                }
+            }
             self.downloadAndInstall(arena, &client, dataset, entry) catch |err| {
                 const hint = switch (err) {
                     error.AuthPending => "客户端已注册但等待平台批准：面板「分发中心 → IP 授权」点「批准」后重跑 zpk sync",
@@ -880,6 +1019,46 @@ test "同步锁：第二个持有者被拒，释放后可再取（进程退出�
 
     var again = SyncLock.acquire(io, dir) orelse return error.TestUnexpectedResult;
     again.release();
+
+    std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+}
+
+test "组件目录缓存新鲜期（CatalogMaxAge）" {
+    const gpa = testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir = "G:/Code/Zig/Pek.ZIP/.zig-cache/catalogtest";
+    std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    std.Io.Dir.cwd().createDirPath(io, dir) catch return error.TestUnexpectedResult;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const now_s: u64 = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+
+    // 1) 没有任何缓存 → 必须联网
+    try testing.expect(!catalogCacheFresh(io, arena, dir, 3600));
+
+    // 2) 刚写入 → 新鲜期内可直接用；`max_age = 0` 表示每次都拉
+    writeCatalogCache(io, arena, dir, "{\"components\":[]}", "c2ln");
+    try testing.expect(catalogCacheFresh(io, arena, dir, 3600));
+    try testing.expect(!catalogCacheFresh(io, arena, dir, 0));
+
+    const meta_path = dir ++ "/.catalog.meta";
+    var stamp_buf: [40]u8 = undefined;
+
+    // 3) 时间戳回退 2 小时 → 超过 1 小时新鲜期
+    const stale = try std.fmt.bufPrint(&stamp_buf, "{d}\n", .{now_s - 7200});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = meta_path, .data = stale });
+    try testing.expect(!catalogCacheFresh(io, arena, dir, 3600));
+
+    // 4) 时间戳在未来（时钟回拨）→ 当作不新鲜，重拉一次
+    const future = try std.fmt.bufPrint(&stamp_buf, "{d}\n", .{now_s + 86_400});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = meta_path, .data = future });
+    try testing.expect(!catalogCacheFresh(io, arena, dir, 3600));
 
     std.Io.Dir.cwd().deleteTree(io, dir) catch {};
 }

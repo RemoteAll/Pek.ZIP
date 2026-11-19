@@ -66,6 +66,28 @@ pub fn componentFileName(url: []const u8) []const u8 {
 pub fn mirrorComponentUrl(arena: std.mem.Allocator, mirror: []const u8, entry_url: []const u8) ![]const u8 {
     return std.fmt.allocPrint(arena, "{s}/components/{s}", .{ mirror, componentFileName(entry_url) });
 }
+
+/// 镜像返回非 2xx 时的**可定位提示**：光看「HTTP 404」猜不出是「RAgent 太旧」「没开镜像」
+/// 还是「面板开了 HTTPS 把明文请求 301 掉了」，这里直接给出下一步动作。
+pub fn mirrorHttpHint(status: u16) []const u8 {
+    return switch (status) {
+        301, 302, 303, 307, 308 => "（镜像要求 HTTPS：RAgent 未放行回环明文，升级 RAgent 后可用 http 回环地址）",
+        403 => "（镜像拒绝访问：可能被 WAF 拦截，或 RAgent 未开启 IpdbMirrorEnabled）",
+        404 => "（镜像端点不存在：RAgent 版本较旧，或没开 IpdbMirrorEnabled）",
+        500...599 => "（镜像内部错误：查 RAgent 日志）",
+        else => "",
+    };
+}
+
+/// 镜像请求**在传输层就失败**时的提示（拿不到状态码，只能按错误类型给下一步）。
+pub fn mirrorFetchHint(err: anyerror) []const u8 {
+    return switch (err) {
+        // 旧版 RAgent 开了 HTTPS：明文 http 请求被连接层 301 到 https，自签证书又验不过 → 表现为传输层失败
+        error.TransportFailed => "（连接/协议失败：若 RAgent 面板开了 HTTPS 且版本较旧，会把明文请求 301 到 https；升级 RAgent 或把 MirrorUrl 改指向平台）",
+        error.Timeout => "（镜像超时：确认 RAgent 在跑、MirrorUrl 的地址与端口正确）",
+        else => "",
+    };
+}
 const MAX_CATALOG_BYTES: usize = 1024 * 1024;
 /// 本地目录缓存：与 `CatalogMaxAge` 配合，避免每次启动/每次 sync 都联网拉目录。
 /// `.catalog.meta` 只有一行 unix 秒（抓取时间）。
@@ -701,7 +723,7 @@ pub const Manager = struct {
                     return false;
                 }
                 active_url = try std.fmt.allocPrint(arena, "{s}{s}", .{ self.cfg.store_url, CATALOG_PATH });
-                std.debug.print("[pek-zip] 镜像目录拉取失败：{s}（{s}），回退平台 {s}\n", .{ @errorName(mirror_err), catalog_url, active_url });
+                std.debug.print("[pek-zip] 镜像目录拉取失败：{s}（{s}），回退平台 {s}{s}\n", .{ @errorName(mirror_err), catalog_url, active_url, mirrorFetchHint(mirror_err) });
                 break :blk client.getBytes(active_url, &.{}, MAX_CATALOG_BYTES) catch |err| {
                     self.setError("拉取组件目录失败：{s}；URL={s}（镜像 {s} 也不可用：{s}）", .{ @errorName(err), active_url, catalog_url, @errorName(mirror_err) });
                     return false;
@@ -710,11 +732,14 @@ pub const Manager = struct {
             if (!response.isSuccess() and mirror != null and !std.mem.eql(u8, active_url, catalog_url)) {
                 // 平台也失败：保持原状（下面统一报错）
             } else if (!response.isSuccess() and mirror != null) {
+                // 先把状态码与提示取出来（response 马上要 deinit，不能再访问）
+                const mirror_status = response.status;
+                const hint = mirrorHttpHint(mirror_status);
                 response.deinit(self.gpa);
                 active_url = try std.fmt.allocPrint(arena, "{s}{s}", .{ self.cfg.store_url, CATALOG_PATH });
-                std.debug.print("[pek-zip] 镜像目录 HTTP {d}，回退平台 {s}\n", .{ response.status, active_url });
+                std.debug.print("[pek-zip] 镜像目录 HTTP {d}{s}，回退平台 {s}\n", .{ mirror_status, hint, active_url });
                 response = client.getBytes(active_url, &.{}, MAX_CATALOG_BYTES) catch |err| {
-                    self.setError("拉取组件目录失败：{s}；URL={s}（镜像 {s} 不可用）", .{ @errorName(err), active_url, catalog_url });
+                    self.setError("拉取组件目录失败：{s}；URL={s}（镜像 {s} 不可用：HTTP {d}{s}）", .{ @errorName(err), active_url, catalog_url, mirror_status, hint });
                     return false;
                 };
             }
@@ -765,7 +790,13 @@ pub const Manager = struct {
         }
 
         var catalog = catalog_mod.parse(self.gpa, catalog_body) catch |err| {
-            self.setError("解析组件目录失败：{s}（URL={s}）", .{ @errorName(err), catalog_url });
+            // 返回 HTML 通常意味着镜像地址指到了面板首页（SPA 回退页），给出可操作提示
+            const head = std.mem.trimStart(u8, catalog_body, " \t\r\n");
+            const hint: []const u8 = if (head.len > 0 and head[0] == '<')
+                "；响应是 HTML（镜像地址可能指到了面板首页，应指向 /ipdb）"
+            else
+                "";
+            self.setError("解析组件目录失败：{s}（URL={s}{s}）", .{ @errorName(err), catalog_url, hint });
             return false;
         };
         defer catalog.deinit();
@@ -1229,6 +1260,21 @@ pub fn currentTarget() []const u8 {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "镜像非 2xx 提示：301/404/403/5xx 各有可操作的下一步，2xx 不提示" {
+    // 301：面板开了 HTTPS 且 RAgent 没放行回环明文（旧版）——提示升级
+    try testing.expect(std.mem.indexOf(u8, mirrorHttpHint(301), "HTTPS") != null);
+    try testing.expect(std.mem.indexOf(u8, mirrorHttpHint(308), "HTTPS") != null);
+    // 404：端点不存在（RAgent 太旧 / 没开镜像）
+    try testing.expect(std.mem.indexOf(u8, mirrorHttpHint(404), "IpdbMirrorEnabled") != null);
+    // 403：WAF / 未开镜像
+    try testing.expect(std.mem.indexOf(u8, mirrorHttpHint(403), "WAF") != null);
+    // 5xx：看 RAgent 日志
+    try testing.expect(std.mem.indexOf(u8, mirrorHttpHint(502), "RAgent 日志") != null);
+    // 其它（含 2xx、无意义的 0）不产生噪音
+    try testing.expectEqualStrings("", mirrorHttpHint(200));
+    try testing.expectEqualStrings("", mirrorHttpHint(418));
+}
 
 test "镜像模式：包地址按文件名重拼到镜像（不绕过镜像直连平台）" {
     const gpa = testing.allocator;

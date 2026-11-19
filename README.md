@@ -67,6 +67,7 @@ AutoEnroll = true                 # 预留
 DownloadV6 = false                # IPv6 xdb 约 37 MiB，默认不下载
 CatalogMaxAge = 3600              # 组件目录缓存新鲜期（秒）；期间只读本地，0 = 每次都拉
 HttpTimeoutMs = 120000            # 单次请求总超时（毫秒；0 = 不限）
+AutoUpdateMinutes = 0             # 后台定时检查更新（分钟；0 = 关闭，常驻服务推荐 360）
 # CaFile   = "Config/ca.pem"      # 内网/自签平台的自定义根证书
 ```
 
@@ -78,6 +79,9 @@ HttpTimeoutMs = 120000            # 单次请求总超时（毫秒；0 = 不限�
 - **同机只下一次**：共享 `CacheDir` 时由 `{CacheDir}/.sync.lock` 独占创建保证一个进程去下载，
   其余进程直接复用；崩溃残留超 10 分钟自动视为陈旧。
 - **定时更新**：由任一个常驻进程（或计划任务）定时跑 `zpk sync` 即可，其余应用启动只读共享缓存。
+  常驻服务可以直接开 `AutoUpdateMinutes`（配置）或 `StartOptions.auto_update_minutes`：
+  后台线程按间隔检查，**只在新版本时才下包并在进程内热替换**（`ensureNow` 同路径），
+  `destroy()` 会立即叫停而不等满间隔。默认 `0` = 关闭——周期任务默认不开。
 
 ### 与 zzig 的关系（复用生态，不重复造）
 

@@ -52,6 +52,9 @@ pub const TEMPLATE =
     \\# 单次 HTTP 请求总超时（毫秒；0 = 不限）。平台不可达时 sync 不会无限挂住；
     \\# 下载大包可用更长预算（比如 600000）。
     \\HttpTimeoutMs = 120000
+    \\# 后台定时检查更新的间隔（分钟；0 = 关闭）。开启后每轮只多一次目录 GET，
+    \\# 且受 CatalogMaxAge 约束——只在发现新版本时才下包（常驻服务推荐 360）。
+    \\AutoUpdateMinutes = 0
     \\# —— 多应用 / 多节点共享（推荐）——
     \\# 同一台机器上的所有应用指向同一组目录：一次注册（StateDir）、一次下载（CacheDir），
     \\# 其余进程直接复用；并发启动由 CacheDir/.sync.lock 保证只有一个去下载。
@@ -88,6 +91,8 @@ pub const Config = struct {
     catalog_max_age: u32 = 3600,
     /// 单次 HTTP 请求总超时（毫秒；0 = 不限）。见 `http.zig` 顶部关于 std 源码的说明。
     http_timeout_ms: u32 = 120_000,
+    /// 后台定时检查更新的间隔（分钟；0 = 关闭）。开启后每轮只多一次目录 GET，有新版本才下包。
+    auto_update_minutes: u32 = 0,
     ca_file: ?[]u8 = null,
 
     pub fn deinit(self: *Config) void {
@@ -173,6 +178,8 @@ pub const Config = struct {
                 self.catalog_max_age = std.fmt.parseInt(u32, unquote(value), 10) catch self.catalog_max_age;
             } else if (std.mem.eql(u8, key, "HttpTimeoutMs")) {
                 self.http_timeout_ms = std.fmt.parseInt(u32, unquote(value), 10) catch self.http_timeout_ms;
+            } else if (std.mem.eql(u8, key, "AutoUpdateMinutes")) {
+                self.auto_update_minutes = std.fmt.parseInt(u32, unquote(value), 10) catch self.auto_update_minutes;
             } else if (std.mem.eql(u8, key, "CaFile")) {
                 const path = unquote(value);
                 if (path.len > 0) {

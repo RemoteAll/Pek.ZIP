@@ -29,6 +29,7 @@ const xdb_mod = @import("xdb.zig");
 const mmdb_mod = @import("mmdb.zig");
 const qqwry_mod = @import("qqwry.zig");
 const locator_mod = @import("locator.zig");
+const fsutil = @import("fsutil.zig");
 
 const IpAddr = ip_mod.IpAddr;
 const Locator = locator_mod.Locator;
@@ -174,6 +175,9 @@ pub const StartOptions = struct {
     force_refresh: bool = false,
     /// 国内命中 ip2region 时跳过 MMDB（省 ~95% 查询耗时；代价：无经纬度/时区/区县/ASN）。
     skip_world_for_china: bool = false,
+    /// 后台定时检查更新的间隔（分钟；`null` = 用配置项，`0` = 关闭）。
+    /// 每轮只多一次目录 GET（受 `CatalogMaxAge` 约束），**只有发现新版本才下包**。
+    auto_update_minutes: ?u32 = null,
 };
 
 /// 极短临界区自旋锁（只保护「退休/销毁」路径，查询热路径不进锁）。
@@ -271,6 +275,13 @@ pub const Manager = struct {
     /// 被替换下来的旧定位器：**只延后释放**（廉价 hazard pointer 替代），
     /// 运行期不销毁，避免「读方刚拿到指针就被销毁」的竞态；替换次数很少（启动一次 + 手动 sync）。
     retired: std.ArrayList(*Shared) = .empty,
+    /// 后台定时检查更新的停止信号（`destroy` 时置位并唤醒等待方）。
+    stop: std.atomic.Value(bool) = .init(false),
+    stop_mutex: std.Io.Mutex = .init,
+    stop_cond: std.Io.Condition = .init,
+    /// 「首轮同步完成」通知（开启定时更新后线程会长期存活，不能靠 join 判就绪）。
+    ready_mutex: std.Io.Mutex = .init,
+    ready_cond: std.Io.Condition = .init,
 
     /// 创建并加载：本地数据立即可用，后台补缺（`background`）。
     pub fn start(io: std.Io, gpa: std.mem.Allocator, base: []const u8, opts: StartOptions) !*Manager {
@@ -311,17 +322,40 @@ pub const Manager = struct {
         return self;
     }
 
-    /// 等待后台任务结束（CLI / 测试 / 优雅退出前调用）。
+    /// 等首轮同步完成（CLI / 测试 / 优雅退出前调用）。
+    ///
+    /// 注意语义：开启 `auto_update_minutes` 后后台线程会长期存活，
+    /// 所以这里等的是「`finished` 置位」而不是 join；真正回收线程在 `destroy` 里。
     pub fn waitIdle(self: *Manager) void {
+        self.ready_mutex.lock(self.io) catch return;
+        defer self.ready_mutex.unlock(self.io);
+        while (!self.finished.load(.acquire)) {
+            // 1s 超时只是兼底（防丢唤醒），正常会被 signal 立即唤醒
+            self.ready_cond.waitTimeout(self.io, &self.ready_mutex, .{ .duration = .{
+                .raw = std.Io.Duration.fromNanoseconds(std.time.ns_per_s),
+                .clock = .real,
+            } }) catch |err| switch (err) {
+                error.Timeout => {},
+                else => return,
+            };
+        }
+    }
+
+    /// 真正回收后台线程（仅 `destroy` 用）。
+    fn joinWorker(self: *Manager) void {
         if (self.worker) |thread| {
             thread.join();
             self.worker = null;
         }
     }
 
-    /// 销毁（会先等后台线程结束，再释放定位器）。
+    /// 销毁（会先叫停后台定时任务，再等线程结束、释放定位器）。
     pub fn destroy(self: *Manager) void {
-        self.waitIdle();
+        self.stop.store(true, .release);
+        self.stop_mutex.lock(self.io) catch {};
+        self.stop_cond.signal(self.io);
+        self.stop_mutex.unlock(self.io);
+        self.joinWorker();
         self.swap_lock.lock();
         if (self.shared.swap(null, .acq_rel)) |shared| {
             self.retired.append(self.gpa, shared) catch {
@@ -397,7 +431,7 @@ pub const Manager = struct {
 
     /// 同步补齐（CLI `sync` 用；会阻塞到下载完成）。
     pub fn ensureNow(self: *Manager) !void {
-        try self.ensureAll();
+        _ = try self.ensureAll(self.opts.check_updates);
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -413,11 +447,30 @@ pub const Manager = struct {
     // -----------------------------------------------------------------------
 
     fn workerMain(self: *Manager) void {
-        defer self.finished.store(true, .release);
+        // 首轮：补缺 + 重建 + 发布（原行为）
+        self.syncPass(false);
+        self.finished.store(true, .release);
+        self.ready_mutex.lock(self.io) catch {};
+        self.ready_cond.signal(self.io);
+        self.ready_mutex.unlock(self.io);
 
-        self.ensureAll() catch |err| {
+        // 之后（可选）：定时检查更新。默认 0 = 关闭——周期任务要先算账，
+        // 开启后每轮只多一次目录 GET（且受 CatalogMaxAge 约束），有新版本才下包。
+        const minutes = self.opts.auto_update_minutes orelse self.cfg.auto_update_minutes;
+        if (minutes == 0) return;
+        while (self.waitForNextCheck(minutes)) {
+            self.syncPass(true);
+        }
+    }
+
+    /// 一次「拉取 → 重建 → 发布」。`force_check` 时即使本地齐全也比对版本；
+    /// 无新版本则不重建（省一次全量打开）。
+    fn syncPass(self: *Manager, force_check: bool) void {
+        const downloaded = self.ensureAll(force_check) catch |err| {
             self.setError("后台补数据失败：{s}（保留当前本地数据继续服务；检查 StoreUrl/网络后重启或执行 sync）", .{@errorName(err)});
+            return;
         };
+        if (force_check and !downloaded) return;
 
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
@@ -431,6 +484,22 @@ pub const Manager = struct {
             return;
         };
         self.publish(locator);
+    }
+
+    /// 等下一次检查（可被 `destroy` 唤醒）。返回 false = 要求停止。
+    fn waitForNextCheck(self: *Manager, minutes: u32) bool {
+        const timeout: std.Io.Timeout = .{ .duration = .{
+            .raw = std.Io.Duration.fromSeconds(@as(i64, minutes) * 60),
+            .clock = .real,
+        } };
+        self.stop_mutex.lock(self.io) catch return false;
+        defer self.stop_mutex.unlock(self.io);
+        if (self.stop.load(.acquire)) return false;
+        self.stop_cond.waitTimeout(self.io, &self.stop_mutex, timeout) catch |err| switch (err) {
+            error.Timeout => return !self.stop.load(.acquire), // 时间到：去检查
+            else => return false,
+        };
+        return !self.stop.load(.acquire); // 被 signal 唤醒（destroy）
     }
 
     fn publish(self: *Manager, locator: Locator) void {
@@ -542,7 +611,11 @@ pub const Manager = struct {
     }
 
     /// 确保 4 个数据集（按配置）都在本地可用：缓存优先，缺失才联网。
-    fn ensureAll(self: *Manager) !void {
+    ///
+    /// `force_check = true` 时即使本地齐全也比对目录版本（后台定时更新用）。
+    /// 返回 `true` = 本次确实下载并安装了新版本（调用方据此决定是否重建定位器）。
+    fn ensureAll(self: *Manager, force_check: bool) !bool {
+        const check_updates = force_check or self.opts.check_updates;
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -556,24 +629,24 @@ pub const Manager = struct {
             const has_local = try self.hasLocal(arena, dataset);
             if (!has_local) missing_count += 1;
             // 缺数据必须去拿；本地齐全时只有「检查更新」才需要目录
-            if (!has_local or self.opts.check_updates) {
+            if (!has_local or check_updates) {
                 needed[needed_count] = dataset;
                 needed_count += 1;
             }
         }
-        if (needed_count == 0) return;
+        if (needed_count == 0) return false;
 
         if (self.cfg.store_url.len == 0) {
             // 纯检查更新 + 离线模式：本地齐全就不必报错
-            if (missing_count == 0) return;
+            if (missing_count == 0) return false;
             self.setError("缺少 {d} 个数据集但未配置 StoreUrl（仅本地缓存模式；把数据放进 {s} 即可）", .{ missing_count, self.cfg.data_dir });
-            return;
+            return false;
         }
 
         // 同机多应用同时启动时，只让一个进程去下载（共享 CacheDir 时全机复用）
         var lock = SyncLock.acquire(self.io, self.cfg.cache_dir) orelse {
             std.debug.print("[pek-zip] 另一进程正在同步数据（锁：{s}/.sync.lock），本次跳过下载，直接复用共享缓存\n", .{self.cfg.cache_dir});
-            return;
+            return false;
         };
         defer lock.release();
 
@@ -590,14 +663,14 @@ pub const Manager = struct {
         } else {
             var response = client.getBytes(catalog_url, &.{}, MAX_CATALOG_BYTES) catch |err| {
                 self.setError("拉取组件目录失败：{s}；URL={s}（{s}）", .{ @errorName(err), catalog_url, fetchHint(err) });
-                return;
+                return false;
             };
             defer response.deinit(self.gpa);
             if (!response.isSuccess()) {
                 self.setError("拉取组件目录失败：HTTP {d}，URL={s}，响应片段：{s}", .{
                     response.status, catalog_url, response.snippet(200),
                 });
-                return;
+                return false;
             }
 
             // 配了 PubKey 就强制验签（目录被篡改宁可不可用）
@@ -606,17 +679,17 @@ pub const Manager = struct {
                 const sig_url = try std.fmt.allocPrint(arena, "{s}.sig", .{catalog_url});
                 var sig_response = client.getBytes(sig_url, &.{}, MAX_SIGNATURE_BYTES) catch |err| {
                     self.setError("拉取组件目录签名失败：{s}；URL={s}（{s}）", .{ @errorName(err), sig_url, fetchHint(err) });
-                    return;
+                    return false;
                 };
                 defer sig_response.deinit(self.gpa);
                 if (!sig_response.isSuccess()) {
                     self.setError("拉取组件目录签名失败：HTTP {d}，URL={s}", .{ sig_response.status, sig_url });
-                    return;
+                    return false;
                 }
                 sig_text = std.mem.trim(u8, sig_response.body, " \t\r\n");
                 auth_mod.verifyBase64(self.cfg.pubkey, response.body, sig_text.?) catch |err| {
                     self.setError("组件目录签名校验失败：{s}（PubKey 或目录可能被篡改；URL={s}）", .{ @errorName(err), catalog_url });
-                    return;
+                    return false;
                 };
             }
             writeCatalogCache(self.io, arena, self.cfg.cache_dir, response.body, sig_text);
@@ -626,10 +699,11 @@ pub const Manager = struct {
 
         var catalog = catalog_mod.parse(self.gpa, catalog_body) catch |err| {
             self.setError("解析组件目录失败：{s}（URL={s}）", .{ @errorName(err), catalog_url });
-            return;
+            return false;
         };
         defer catalog.deinit();
 
+        var downloaded = false;
         const target = currentTarget();
         for (needed[0..needed_count]) |dataset| {
             const entry = catalog_mod.select(catalog, dataset.id(), target) orelse {
@@ -638,7 +712,7 @@ pub const Manager = struct {
                 });
                 continue;
             };
-            if (self.opts.check_updates) {
+            if (check_updates) {
                 // 只在远端版本更高时才下载（同版本/更低一律跳过，省带宽）
                 const latest = self.store.findLocalLatest(arena, dataset.id()) catch |err| blk: {
                     std.debug.print("[pek-zip] 读取 {s} 本地版本失败：{s}（按需重新下载）\n", .{ dataset.id(), @errorName(err) });
@@ -654,7 +728,9 @@ pub const Manager = struct {
                     std.debug.print("[pek-zip] {s} 发现新版本：{s} → {s}\n", .{ dataset.id(), installed.version, entry.version });
                 }
             }
-            self.downloadAndInstall(arena, &client, dataset, entry) catch |err| {
+            if (self.downloadAndInstall(arena, &client, dataset, entry)) |_| {
+                downloaded = true;
+            } else |err| {
                 const hint = switch (err) {
                     error.AuthPending => "客户端已注册但等待平台批准：面板「分发中心 → IP 授权」点「批准」后重跑 zpk sync",
                     error.AuthRevoked => "客户端已被平台吐销：面板「IP 授权」页恢复并重新批准",
@@ -667,8 +743,9 @@ pub const Manager = struct {
                 } else {
                     self.setError("安装 {s} 失败：{s}（version={s}，url={s}）", .{ dataset.id(), @errorName(err), entry.version, entry.url });
                 }
-            };
+            }
         }
+        return downloaded;
     }
 
     /// 懒加载授权客户端（身份文件在 `StateDir`，首次创建后持久化）。
@@ -1114,4 +1191,39 @@ test "并发读取期间热替换不崩溃（引用计数）" {
     for (&threads) |thread| thread.join();
 
     std.Io.Dir.cwd().deleteTree(io, base) catch {};
+}
+
+test "定时检查更新：destroy 能立即叫停等待中的后台线程" {
+    const gpa = testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const base = "G:/Code/Zig/Pek.ZIP/.zig-cache/mgrtest3";
+    std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, base) catch {};
+
+    // StoreUrl 留空（离线模式）：首轮 ensureAll 立刻返回，之后进入 60 分钟的等待
+    try std.Io.Dir.cwd().createDirPath(io, base ++ "/Config");
+    try fsutil.writeFileAtomic(io, gpa, base ++ "/Config/Ip.toml",
+        \\StoreUrl = "http://127.0.0.1:1"
+        \\AutoEnroll = false
+        \\DownloadV6 = false
+        \\DataDir = "data"
+        \\CacheDir = "cache"
+        \\StateDir = "client"
+        \\HttpTimeoutMs = 2000
+        \\
+    );
+
+    const manager = try Manager.start(io, gpa, base, .{
+        .background = true,
+        .auto_update_minutes = 60,
+    });
+    manager.waitIdle(); // 首轮跑完
+
+    const start = std.Io.Clock.real.now(io).nanoseconds;
+    manager.destroy(); // 必须唤醒等待并退出，而不是等满 60 分钟
+    const elapsed_ms = @divTrunc(std.Io.Clock.real.now(io).nanoseconds - start, std.time.ns_per_ms);
+    try testing.expect(elapsed_ms < 3000);
 }

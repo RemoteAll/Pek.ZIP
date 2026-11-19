@@ -86,6 +86,8 @@ MirrorProbeUrl = "http://127.0.0.1:5501/ipdb"  # 自动探测地址（空串 = �
   要改端口/地址就用 `MirrorUrl` 显式指定，或改 `MirrorProbeUrl`；置 `MirrorProbeUrl = ""` 可关闭自动探测。
   镜像布局是 `/ipdb/catalog.json` + `/ipdb/components/*.zip`，只转发平台原始字节，**验签仍用平台公钥**。
   镜像缺文件/没启动/返回非 2xx 时**自动回退平台**，不会因开镜像而同步失败。
+  RAgent 面板即使开了 HTTPS，镜像也走上面的 **http 回环地址**：RAgent 连接层只对回环放行 `/ipdb`
+  的明文请求（本机取数据不必导入自签证书），非本机访问才 301 到 https。
   RAgent 侧开 `IpdbAutoEnroll` 后会以独立身份向平台注册（首次需在「分发中心 → IP 授权」批准一次），
   之后它就自己取票下包，本机各应用零配置、不再各自连平台。
 - **定时更新**：由任一个常驻进程（或计划任务）定时跑 `zpk sync` 即可，其余应用启动只读共享缓存。

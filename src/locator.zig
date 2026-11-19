@@ -173,6 +173,27 @@ pub const Locator = struct {
 
     /// 查询 IP（零分配；结果切片借用 locator 或 `scratch`）。
     pub fn lookup(self: *const Locator, scratch: *Scratch, ip_in: IpAddr) !Location {
+        return self.lookupOptions(scratch, ip_in, .{});
+    }
+
+    /// 查询选项。
+    pub const Options = struct {
+        /// 命中 ip2region 国内记录时**跳过 MMDB**。
+        ///
+        /// 实测（ReleaseFast，真实数据）：国内 IP 的 MMDB 查询占整体耗时的 ~95%
+        /// （xdb 66 ns/op vs 合并 1930 ns/op）。日志分析 / 地区统计这类只要
+        /// 国家-省-市-ISP 的场景开它会快一个数量级；代价是拿不到
+        /// 经纬度 / 时区 / 区县 / ASN（国外 IP 仍照常走 MMDB，不受影响）。
+        skip_world_for_china: bool = false,
+    };
+
+    /// 带选项的查询。
+    pub fn lookupOptions(
+        self: *const Locator,
+        scratch: *Scratch,
+        ip_in: IpAddr,
+        options: Options,
+    ) !Location {
         const ip = ip_in.normalize();
         if (ip_mod.classify(ip)) |class| return Location.reserved(ip, class);
 
@@ -185,13 +206,21 @@ pub const Locator = struct {
             if (try self.lookupQqwry(scratch, ip)) |parsed| cn = parsed;
         }
 
+        // 国内快速路径：省市/ISP 已由 ip2region 给出，再查 MMDB 只为补
+        // 经纬度/时区/区县/ASN，不必要时省掉（这是国内流量的主要开销）
+        const skip_world = options.skip_world_for_china and (cn != null and cn.?.isChinaRegion());
+
         var world: ?mmdb_mod.WorldRecord = null;
-        if (self.world) |*reader| {
-            world = try reader.lookupWorld(ip);
+        if (!skip_world) {
+            if (self.world) |*reader| {
+                world = try reader.lookupWorld(ip);
+            }
         }
         var asn: ?mmdb_mod.AsnRecord = null;
-        if (self.world_asn) |*reader| {
-            asn = try reader.lookupAsn(ip);
+        if (!skip_world) {
+            if (self.world_asn) |*reader| {
+                asn = try reader.lookupAsn(ip);
+            }
         }
 
         return merge(ip, cn, world, asn, self.qqwry != null and self.xdb_v4 == null and self.xdb_v6 == null);
@@ -567,6 +596,30 @@ test "真实数据端到端（xdb + MMDB）" {
     std.debug.print("[locator] 114.114.114.114 → {s}（{s}）\n", .{ cn.displayShort(&buf), cn.source.label() });
     try testing.expect(cn.is_china);
     try testing.expectEqualStrings("CN", cn.country_code.?);
+
+    // 国内快路径：命中 ip2region 后不再查 MMDB（省 ~1.5 µs/次）
+    if (locator.world != null) {
+        var fast_scratch: Scratch = .{};
+        const fast = try locator.lookupOptions(&fast_scratch, try IpAddr.parse("114.114.114.114"), .{
+            .skip_world_for_china = true,
+        });
+        try testing.expectEqual(DataSource.ip2region, fast.source);
+        try testing.expect(fast.latitude == null);
+        try testing.expect(fast.timezone == null);
+        // 省市仍然来自 ip2region，不能因为跳过 MMDB 就丢
+        try testing.expectEqualStrings(cn.province.?, fast.province.?);
+        try testing.expectEqualStrings(cn.city.?, fast.city.?);
+
+        // 国外 IP 不受该开关影响：与不开开关的结果完全一致
+        var slow_scratch: Scratch = .{};
+        var fast_scratch2: Scratch = .{};
+        const us_slow = try locator.lookupOptions(&slow_scratch, try IpAddr.parse("89.160.20.128"), .{});
+        const us_fast = try locator.lookupOptions(&fast_scratch2, try IpAddr.parse("89.160.20.128"), .{
+            .skip_world_for_china = true,
+        });
+        try testing.expectEqual(us_slow.source, us_fast.source);
+        try testing.expectEqualStrings(us_slow.country_code.?, us_fast.country_code.?);
+    }
 
     const us = try locator.lookupStr(&scratch, "8.8.8.8");
     std.debug.print("[locator] 8.8.8.8 → {s}（{s}）\n", .{ us.displayShort(&buf), us.source.label() });

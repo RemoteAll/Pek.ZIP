@@ -31,6 +31,7 @@ fn run(io: std.Io, gpa: std.mem.Allocator, argv: []const [:0]const u8) !u8 {
     var base: []const u8 = ".";
     var online = false;
     var force_refresh = false;
+    var fast = false;
     var positional: [64][]const u8 = undefined;
     var positional_count: usize = 0;
 
@@ -55,6 +56,10 @@ fn run(io: std.Io, gpa: std.mem.Allocator, argv: []const [:0]const u8) !u8 {
             force_refresh = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--fast")) {
+            fast = true;
+            continue;
+        }
         if (std.mem.startsWith(u8, arg, "-")) return usage(io, "未知参数");
         if (positional_count >= positional.len) return usage(io, "参数过多");
         positional[positional_count] = arg;
@@ -75,6 +80,7 @@ fn run(io: std.Io, gpa: std.mem.Allocator, argv: []const [:0]const u8) !u8 {
         const manager = try pek.Manager.start(io, gpa, base, .{
             .background = online,
             .allow_partial = true,
+            .skip_world_for_china = fast,
         });
         defer manager.destroy();
 

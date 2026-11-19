@@ -48,6 +48,7 @@ locator.world_asn = try pek.MmdbReader.open(io, gpa, "data/dbip-asn-lite.mmdb", 
 ```text
 zpk lookup 114.114.114.114 8.8.8.8   # 查询（默认只读本地，不因网络卡住）
 zpk lookup 114.114.114.114 --online  # 后台补缺并等下载结束再退出
+zpk lookup 114.114.114.114 --fast    # 国内命中即跳过 MMDB（快 ~9.5×；代价：无经纬度/时区/区县/ASN）
 zpk sync                             # 检查更新：本地齐全也比对目录版本，有新版本才下
 zpk sync --force                     # 忽略 CatalogMaxAge 目录缓存，强制联网刷新
 zpk selfcheck                        # 配置 + 数据集状态 + 样例查询
@@ -77,6 +78,19 @@ HttpTimeoutMs = 120000            # 单次请求总超时（毫秒；0 = 不限�
 - **同机只下一次**：共享 `CacheDir` 时由 `{CacheDir}/.sync.lock` 独占创建保证一个进程去下载，
   其余进程直接复用；崩溃残留超 10 分钟自动视为陈旧。
 - **定时更新**：由任一个常驻进程（或计划任务）定时跑 `zpk sync` 即可，其余应用启动只读共享缓存。
+
+### 性能与调优（实测，ReleaseFast，20 万次/项）
+
+| 场景 | ns/op | 备注 |
+|---|---|---|
+| xdb（ip2region v4） | 44.9 | 比 ip2region 官方 full-cache（167 ns）还快，因为 mmap 零拷贝 |
+| MMDB（国外库） | 1552.6 | 二进制搜索树 + 数据段解析 |
+| 合并 lookup（默认） | 1765.4 | 国内 IP 也会为补经纬度/时区/区县 付一次 MMDB |
+| 合并 lookup（`--fast` / `skip_world_for_china`） | **186.6** | 国内命中即跳过 MMDB，**9.5×** |
+| 保留地址短路 | 9.8 | 内网/回环等不查库 |
+
+- **不做内存缓存/整文件加载**：mmap + 文件内 Vector Index 已经快于官方 full-cache，且零拷贝、多进程共享 page cache。
+- **国内快路径默认关闭**：开了会静默丢掉经纬度/时区/区县/ASN，必须显式选。
 
 ### 请求超时（复用 zzig 的原生取消，不是自造看门狗）
 
@@ -118,19 +132,22 @@ sequenceDiagram
 - **失败不降级**：下载/校验失败只记 `lastError()`，旧数据继续服务；`zpk sync` 返回码 1。
 - **为什么是线程**：Zig 0.17 在 Windows 上 socket 读仍是同步 `deviceIoControl`，真异步需自建 AFD/IOCP；放独立线程是当前平台唯一能「启动不等网络」的做法（POSIX 可换 `Io.concurrent`，接口不变）。
 
-## 性能（实测，ReleaseFast，本机 2026-11-18）
+## 性能（实测，ReleaseFast，本机 2026-11-19）
 
-数据：`ip2region_v4.xdb`（11 MiB）+ `dbip-country-lite-2026-10.mmdb`（8 MiB，IPv6 树）+ `dbip-asn-lite`，20 万次/项：
+数据：`ip2region_v4.xdb`（11 MiB）+ `dbip-country-lite-2026-10.mmdb`（8 MiB，IPv6 树）+ `dbip-asn-lite`，20 万次/项。
+样例 IP 取国内段 114.114.0.0/16（中文场景的真实分布）：
 
 | 场景 | ns/op | QPS |
 |------|-------|-----|
-| xdb（ip2region v4） | 66 | 15,162,657 |
-| MMDB（国外库） | 1,547 | 646,469 |
-| 合并 lookup | 1,930 | 518,153 |
-| 保留地址短路 | 9.1 | 110,472,824 |
-| 4 线程并发 lookup | 487 | 2,051,787 |
+| xdb（ip2region v4） | 45 | 22,262,542 |
+| MMDB（国外库） | 1,553 | 644,072 |
+| 合并 lookup | 1,765 | 566,445 |
+| 合并 lookup（`skip_world_for_china`） | **187** | **5,358,913** |
+| 保留地址短路 | 9.8 | 101,786,350 |
+| 4 线程并发 lookup | 471 | 2,123,900 |
 
-复现：`zig build bench -- 'G:/Code/Rust/Pek.IP/data' 200000`（库模块同样 ReleaseFast）。
+参照：ip2region 官方 Rust binding 的 full-cache 是 120–139 ns（avg 167 ns），**我们的 mmap + Vector Index 更快**，
+不需要再上内存缓存。复现：`zig build bench -- 'G:/Code/Rust/Pek.IP/data' 200000`（库模块同样 ReleaseFast）。
 
 设计要点：mmap 只读（v6 库 37 MiB 不进进程私有内存，多进程共享页缓存）、查询零分配（切片借用映射内存）、标签/国家名走编译期静态表二分。
 

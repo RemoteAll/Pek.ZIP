@@ -1,4 +1,4 @@
-//! 查询热路径基准（固定 `ReleaseFast`）。
+﻿//! 查询热路径基准（固定 `ReleaseFast`）。
 //!
 //! ```text
 //! zig build bench -- <数据目录> [轮数=200000]
@@ -44,8 +44,9 @@ pub fn main(init: std.process.Init) !void {
         state = state *% 6364136223846793005 +% 1442695040888963407;
         const value: u32 = @truncate(state >> 32);
         ips.append(gpa, state: {
-            // 只取公网段，避免全落在保留地址
-            const high: u32 = (value & 0x00ff_ffff) | 0x0e00_0000; // 14.0.0.0/8 附近
+            // 取国内段（114.114.0.0/16 = 江苏等）——中文场景下绝大多数查询是国内 IP，
+            // 这样「合并 vs 国内快路径」的差异才是真实业务差异
+            const high: u32 = (value & 0x0000_ffff) | 0x7272_0000; // 114.114.0.0/16（江苏，国内命中）
             break :state .{ .v4 = high };
         }) catch unreachable;
     }
@@ -58,6 +59,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .name = "xdb (ip2region v4)", .kind = .xdb },
         .{ .name = "mmdb (国外库)", .kind = .mmdb },
         .{ .name = "合并 lookup", .kind = .merged },
+        .{ .name = "合并 lookup（国内快路径）", .kind = .merged_fast },
         .{ .name = "保留地址短路", .kind = .reserved },
     };
 
@@ -80,6 +82,10 @@ pub fn main(init: std.process.Init) !void {
                 },
                 .merged => {
                     const loc = locator.lookup(&scratch, ip) catch continue;
+                    sink +%= loc.source.label().len;
+                },
+                .merged_fast => {
+                    const loc = locator.lookupOptions(&scratch, ip, .{ .skip_world_for_china = true }) catch continue;
                     sink +%= loc.source.label().len;
                 },
                 .reserved => {
@@ -135,4 +141,4 @@ pub fn main(init: std.process.Init) !void {
     try std.Io.File.stdout().writeStreamingAll(io, text);
 }
 
-const Kind = enum { xdb, mmdb, merged, reserved };
+const Kind = enum { xdb, mmdb, merged, merged_fast, reserved };

@@ -172,6 +172,8 @@ pub const StartOptions = struct {
     check_updates: bool = false,
     /// 忽略 `CatalogMaxAge` 缓存新鲜期，强制联网拉目录（`zpk sync --force`）。
     force_refresh: bool = false,
+    /// 国内命中 ip2region 时跳过 MMDB（省 ~95% 查询耗时；代价：无经纬度/时区/区县/ASN）。
+    skip_world_for_china: bool = false,
 };
 
 /// 极短临界区自旋锁（只保护「退休/销毁」路径，查询热路径不进锁）。
@@ -368,7 +370,9 @@ pub const Manager = struct {
         };
         defer self.release(shared);
         _ = self.lookups.fetchAdd(1, .monotonic);
-        return shared.locator.lookup(scratch, ip);
+        return shared.locator.lookupOptions(scratch, ip, .{
+            .skip_world_for_china = self.opts.skip_world_for_china,
+        });
     }
 
     /// 查询 IP 文本。

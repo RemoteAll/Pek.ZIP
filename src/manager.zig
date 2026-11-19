@@ -672,9 +672,9 @@ pub const Manager = struct {
         client.timeout_ms = self.cfg.http_timeout_ms;
 
         const catalog_url = if (self.cfg.mirror_url.len > 0)
-            // 镜像（本机 RAgent 等）同样放出 `/components/catalog.json` 与 `.sig`，字节与平台一致，
-            // 所以验签仍然对着平台公钥（镜像只转发不重签）。
-            try std.fmt.allocPrint(arena, "{s}{s}", .{ self.cfg.mirror_url, CATALOG_PATH })
+            // 镜像根就是 `/ipdb`（RAgent 的布局：`/ipdb/catalog.json` + `/ipdb/components/*.zip`），
+            // 字节与平台一致，所以验签仍然对着平台公钥（镜像只转发不重签）。
+            try std.fmt.allocPrint(arena, "{s}/catalog.json", .{self.cfg.mirror_url})
         else
             try std.fmt.allocPrint(arena, "{s}{s}", .{ self.cfg.store_url, CATALOG_PATH });
 

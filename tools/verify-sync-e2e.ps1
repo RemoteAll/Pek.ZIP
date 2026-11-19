@@ -78,6 +78,10 @@ function Write-Catalog([string]$version, [string]$hash) {
     }
     $json = [ordered]@{ components = @($entry) } | ConvertTo-Json -Depth 6
     [System.IO.File]::WriteAllText("$root\srv\components\catalog.json", $json, (New-Object System.Text.UTF8Encoding($false)))
+    # 本机镜像（与 RAgent 的 /ipdb 布局一致：/ipdb/catalog.json + /ipdb/components/*.zip）
+    New-Item -ItemType Directory -Force "$root\srv\ipdb\components" | Out-Null
+    [System.IO.File]::WriteAllText("$root\srv\ipdb\catalog.json", $json, (New-Object System.Text.UTF8Encoding($false)))
+    Copy-Item "$root\srv\components\ip2region-v4-2026.10-any.zip", "$root\srv\components\ip2region-v4-2026.11-any.zip" "$root\srv\ipdb\components\" -Force
 }
 
 Write-Catalog '2026.10' $h10
@@ -130,7 +134,7 @@ try {
     New-Item -ItemType Directory -Force "$root\base2\Config", "$root\base2\data" | Out-Null
     Set-Content "$root\base2\data\dbip-city-lite.mmdb" -Value 'placeholder' -Encoding ascii
     Set-Content "$root\base2\data\dbip-asn-lite.mmdb" -Value 'placeholder' -Encoding ascii
-    $cfg_mirror = "StoreUrl = `"http://127.0.0.1:1`"`nMirrorUrl = `"http://127.0.0.1:$port`"`nPubKey = `"`"`nAutoEnroll = false`nDownloadV6 = false`nDataDir = `"data`"`nCacheDir = `"cache`"`nStateDir = `"client`"`nCatalogMaxAge = 0`nHttpTimeoutMs = 5000`n"
+    $cfg_mirror = "StoreUrl = `"http://127.0.0.1:1`"`nMirrorUrl = `"http://127.0.0.1:$port/ipdb`"`nPubKey = `"`"`nAutoEnroll = false`nDownloadV6 = false`nDataDir = `"data`"`nCacheDir = `"cache`"`nStateDir = `"client`"`nCatalogMaxAge = 0`nHttpTimeoutMs = 5000`n"
     [System.IO.File]::WriteAllText("$root\base2\Config\Ip.toml", $cfg_mirror, (New-Object System.Text.UTF8Encoding($false)))
     $code5 = Invoke-Zpk @('sync', '--base', "$root\base2") "$root\sync4.txt"
     $mirror_installed = Test-Path "$root\base2\cache\ip2region-v4\2026.11"

@@ -78,14 +78,14 @@ HttpTimeoutMs = 120000            # 单次请求总超时（毫秒；0 = 不限�
   其余进程直接复用；崩溃残留超 10 分钟自动视为陈旧。
 - **定时更新**：由任一个常驻进程（或计划任务）定时跑 `zpk sync` 即可，其余应用启动只读共享缓存。
 
-### 请求超时（为什么自己实现）
+### 请求超时（复用 zzig 的原生取消，不是自造看门狗）
 
-Zig 0.17.1 的 `std.http.Client` **没有任何生效的超时**：
-`ConnectTcpOptions.timeout` 虽然声明了，但 `connectTcpOptions` 从不读它（内部 `host.connect` 只用 `.mode`）；
-而底层 `Io.net.ConnectOptions.timeout`、`Socket.sendTimeout/receiveTimeout` 其实都是生效的——只是 HTTP 层没接。
+Zig 0.17.1 的 `std.http.Client` **没有生效的超时**：`ConnectTcpOptions.timeout` 声明了但 `connectTcpOptions` 从不读取它。
+但 0.17 有**原生并发取消**：`Io.concurrent(io, fn, args)` → `Future`，`Future.cancel(io)` 会请求取消并**等任务结束**。
+同生态 `zzig/src/http/http.zig` 的 `fetchBytesWithTimeout` 已是这套做法（已上线），本项目直接复用该机制（仅把轮询换成
+`Io.Condition.waitTimeout`，事件驱动、无空转）。
 
-所以 `src/http.zig` 自己做了看门狗：请求跑在独立线程，主线程最多等 `HttpTimeoutMs` 就返回 `Error.Timeout`，
-专门覆盖「连上了但服务器不回数据」这类挂死（实测：本地启一个只 accept 不回包的监听，1200ms 配置 → **1.32s 返回 Timeout**）。
+效果：超时 → 取消请求并**把线程收回来**（不泄漏线程）；实测“只 accept 不回包”的监听 + `HttpTimeoutMs=1200` → **1.25s 返回 Timeout**。
 
 数据文件命名（不区分大小写，与 Pek.IP 一致）：
 

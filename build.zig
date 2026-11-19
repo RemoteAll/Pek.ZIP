@@ -19,6 +19,16 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_tests = b.addRunArtifact(tests);
+    // **测试必须真跑**：Zig 默认会缓存「run test」步的结果，命中缓存时 `zig build test`
+    // 只打印 "run test cached"、一行测试输出都没有（看起来像"什么都没做就通过"）。
+    // 置 has_side_effects 后每次都真正执行测试二进制。
+    //
+    // 另注：Zig 0.17.1 的 build runner 在跑 test 产物时会用 `--listen=-` 协议，
+    // 我们的测试有大量 stderr 输出（真实数据用例的对照行），某些情况下 stderr 里会出现一行
+    // `failed command: ... --listen=-`；实测同一次运行的行内汇总仍是 `67/67 tests passed`、
+    // 退出码 0，而同一个二进制**不带 `--listen` 直接跑**（`zig test src/root.zig`）从无此现象。
+    // 因此：一键回归以 `zig test src/root.zig` 为准（见 tools/regression.ps1），本步只作开发便捷入口。
+    run_tests.has_side_effects = true;
     const test_step = b.step("test", "运行单元测试（含 xdb/mmdb/qqwry 与内核合并逻辑）");
     test_step.dependOn(&run_tests.step);
 
